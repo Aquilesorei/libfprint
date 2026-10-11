@@ -1,5 +1,4 @@
 /*
-/*
  * Synaptics Tudor Match-In-Sensor driver for libfprint
  *
  * Copyright (c) 2024 Francesco Circhetta, Vojtěch Pluskal

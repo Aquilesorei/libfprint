@@ -42,6 +42,9 @@ status_to_str (guint16 status)
     case 0x000:
       ret = "VCS_RESULT_OK_1";
       break;
+    case 0x315:
+      ret = "VCS_RESULT_SENSOR_TLS_INTERNAL_FAILURE";
+      break;
     case 0x401:
       ret = "VCS_RESULT_SENSOR_BAD_CMD";
       break;
@@ -90,11 +93,8 @@ status_to_str (guint16 status)
     case 0x70e:
       ret = "VCS_RESULT_OK_4";
       break;
-    case 0x315:
-      ret = "last TLS session was not properly closed";
-      break;
     default:
-      ret = "generic VCS_RESULT_SENSOR_MALFUNCTIONED";
+      ret = "generic VCS_RESULT_SENSOR_MALFUNCTIONED or name not known";
     }
 
   return ret;
@@ -198,10 +198,10 @@ cmd_to_str (guint8 cmd)
       ret = "VCSFW_CMD_ENROLL";
       break;
     case 0x99:
-      ret = "VCSFW_CMD_IDENTIFY_MATCH";
+      ret = "VCSFW_CMD_IDENTIFY_WBF";
       break;
     case 0x9d:
-      ret = "VCSFW_CMD_GET_IMAGE_METRICS";
+      ret = "VCSFW_CMD_IMAGE_METRICS";
       break;
     case 0x9e:
       ret = "VCSFW_CMD_DB2_GET_DB_INFO";
@@ -302,7 +302,7 @@ event_type_to_str (guint8 event_type)
       ret = "FINGER_DOWN";
       break;
     case 2:
-      ret = "FINGER_DOWN";
+      ret = "FINGER_UP";
       break;
     case 24:
       ret = "FRAME_READY";

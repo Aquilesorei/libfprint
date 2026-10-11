@@ -139,6 +139,7 @@ tagval_get (TagVal *self, guint16 tag, guint8 **val, gsize *val_size, GError **e
     {
       g_propagate_error (error, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
                                                           "Tag %d not found", tag));
+      return FALSE;
     }
 
   *val = (guint8 *) g_bytes_get_data (val_bytes, NULL);
@@ -201,7 +202,8 @@ hashtagval_new_from_bytes (guint8 *container, gsize length, GError **error)
   while (fpi_byte_reader_get_remaining (&reader) > 0)
     {
       guint16 tag, val_size;
-      guint8 *val, *hash;
+      g_autofree guint8 *val = NULL;
+      g_autofree guint8 *hash = NULL;
 
       read_ok &= fpi_byte_reader_get_uint16_le (&reader, &tag);
       read_ok &= fpi_byte_reader_get_uint16_le (&reader, &val_size);
@@ -227,7 +229,9 @@ hashtagval_new_from_bytes (guint8 *container, gsize length, GError **error)
         }
 
       if (!g_hash_table_insert (new->hashvals, GINT_TO_POINTER (tag),
-                                hashval_new (val, val_size, hash)))
+                                hashval_new (
+                                    g_steal_pointer (&val), val_size,
+                                    g_steal_pointer (&hash))))
         {
           local_error = fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
                                                   "Tag %d already exists", tag);

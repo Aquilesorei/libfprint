@@ -42,7 +42,7 @@
 #include "tls_session.h"
 #include "utils.h"
 
-// #define DEBUG_SSL TRUE
+// #define DEBUG_SSL
 
 #define RANDOM_SIZE 32
 #define MASTER_SECRET_SIZE 48
@@ -50,20 +50,8 @@
 #define MAX_SESSION_ID_SIZE 32
 #define MAX_HASH_SIZE 64
 #define MAX_KEY_BLOCK_SIZE 128
-#define CERTIFICATE_MAX_KEY_SIZE 68
-#define SIGNATURE_SIZE 256
 
-#define ASPRINTF_ERROR_CHECK(msg, ...)                                       \
-  do                                                                         \
-    {                                                                        \
-      if (asprintf (&msg, ##__VA_ARGS__) == -1)                              \
-        {                                                                    \
-          msg = g_memdup2 (asprintf_error_msg, strlen (asprintf_error_msg)); \
-        }                                                                    \
-    }                                                                        \
-  while (0)
-
-static const char *asprintf_error_msg = "asprintf error";
+#define TLS_NO_ALERT (-1)
 
 typedef enum
 {
@@ -153,8 +141,9 @@ struct _TlsSession
   guint num_supported_extensions;
   Extenstion *supported_extensions;
 
-  // FIXME: currently only set and not read
-  guint8 raised_alert_desc;
+  /* alert description for the last protocol error, or TLS_NO_ALERT, like the
+   * Windows driver (ssiTlsReceiveData) - reported but not sent to sensor */
+  gint8 raised_alert_desc;
 
   FpiByteWriter send_buffer;
 
@@ -165,12 +154,12 @@ struct _TlsSession
 
   const char *hash_algo;
 
-  // FIXME: what to fix? - design this module without these
-  /* Comment from Francesco Circhetta, who conceived this:
-   * The TLS layer, for how I conceived it, should not know anything about the sensor and get only the relevant certificate and keys during initialization. It shouldn't even bother with pairing at all.
-   */
   guint8 cert_request;
-  SensorPairingData *pairing_data;
+
+  guint8 *client_cert;
+  gsize client_cert_len;
+  EVP_PKEY *client_key;
+  EVP_PKEY *server_pub_key;
   // gboolean established;
   // gboolean server_established;
 };
@@ -211,6 +200,13 @@ get_serialized_extensions (TlsSession *self, guint8 **serialized, gsize *seriali
 void
 tls_session_free (TlsSession *self)
 {
+  if (self == NULL)
+    return;
+
+  g_free (self->client_cert);
+  EVP_PKEY_free (self->client_key);
+  EVP_PKEY_free (self->server_pub_key);
+
   g_free (self->session_id);
   g_free (self->suites);
   g_free (self->supported_extensions);
@@ -229,11 +225,11 @@ tls_session_free (TlsSession *self)
   g_free (self);
 }
 
-static gboolean
+gboolean
 tls_prf (guint8 *secret, gsize secret_size, const gchar *label, guint label_len, guint8 *seed, guint seed_size, guint8 *out, gsize outsize, const char *hash_algo, GError **error)
 {
   g_autoptr (EVP_KDF) kdf = NULL;
-  g_autoptr (EVP_KDF_CTX) kctx;
+  g_autoptr (EVP_KDF_CTX) kctx = NULL;
   g_autofree char *label_cpy = g_memdup2 (label, label_len + 1);
   g_autofree char *hash_algo_cpy = g_strdup (hash_algo);
   OSSL_PARAM params[5], *p = params;
@@ -414,8 +410,8 @@ tls_session_encrypt (TlsSession *self, guint8 type, guint8 *ptext, gsize ptext_s
         RAND_bytes (nonce, NONCE_SIZE);
 
         // encr_iv + nonce
-        gcm_iv = g_malloc (AES_GCM_IV_SIZE + NONCE_SIZE);
-        memcpy (gcm_iv, self->encr_iv, AES_GCM_IV_SIZE);
+        gcm_iv = g_malloc (self->encr_iv_len + NONCE_SIZE);
+        memcpy (gcm_iv, self->encr_iv, self->encr_iv_len);
         memcpy (gcm_iv + self->encr_iv_len, nonce, NONCE_SIZE);
 
         // additional_data = seq_num + TLSCompressed.type + TLSCompressed.version
@@ -440,7 +436,7 @@ tls_session_encrypt (TlsSession *self, guint8 type, guint8 *ptext, gsize ptext_s
         unsigned char tag[AES_GCM_TAG_SIZE];
 
         if (!gcm_encrypt (ptext, ptext_size, additional, additional_size,
-                          self->encr_key, gcm_iv, NONCE_SIZE + AES_GCM_IV_SIZE,
+                          self->encr_key, gcm_iv, NONCE_SIZE + self->encr_iv_len,
                           cdata, &cdata_size, tag, &local_error))
           {
             g_propagate_error (error, local_error);
@@ -603,8 +599,14 @@ static gboolean
 tls_session_send (TlsSession *self, TlsRecord *record, GError **error)
 {
   GError *local_error = NULL;
-  g_assert (!self->send_closed);
-#if DEBUG_SSL
+  if (self->send_closed)
+    {
+      g_propagate_error (error, fpi_device_error_new_msg (
+                                    FP_DEVICE_ERROR_PROTO,
+                                    "Cannot send TLS message when closed"));
+      return FALSE;
+    }
+#ifdef DEBUG_SSL
   fp_dbg ("-> %s", record->repr);
 #endif
 
@@ -644,12 +646,12 @@ tls_session_send_alert (TlsSession *self, guint8 level, guint8 description, GErr
   record->length = fpi_byte_writer_get_pos (&writer);
   record->fragment = fpi_byte_writer_reset_and_get_data (&writer);
 
-  ASPRINTF_ERROR_CHECK (record->repr,
-                        "TlsAlert(level=\"%s\", description=\"%s\")",
-                        level == SSL3_AL_WARNING ? "warning" : "fatal",
-                        SSL_alert_desc_string_long (description));
+  record->repr = g_strdup_printf (
+      "TlsAlert(level=\"%s\", description=\"%s\")",
+      level == SSL3_AL_WARNING ? "warning" : "fatal",
+      SSL_alert_desc_string_long (description));
 
-  if (!tls_session_send (self, record, NULL))
+  if (!tls_session_send (self, record, &local_error))
     {
       g_propagate_error (error, local_error);
       return FALSE;
@@ -677,8 +679,6 @@ tls_session_close (TlsSession *self, GError **error)
       return FALSE;
     }
 
-  self->send_closed = TRUE;
-
   return TRUE;
 }
 
@@ -702,12 +702,11 @@ tls_session_send_handshake_msg (TlsSession *self, Handshake *msg, GError **error
   record->version = TLS1_2_VERSION;
   record->length = fpi_byte_writer_get_pos (&writer);
   record->fragment = fpi_byte_writer_reset_and_get_data (&writer);
-  ASPRINTF_ERROR_CHECK (record->repr,
-                        "HandshakeMessage(type=0x%02x, content=%s)",
-                        msg->msg_type, msg->repr);
-
+  record->repr = g_strdup_printf ("HandshakeMessage(type=0x%02x, content=%s)",
+                                  msg->msg_type, msg->repr);
+  //
   // Update hash
-  // BROKEN The windows driver only updates it when the message isn't
+  // nonstandard: The windows driver only updates it when the message isn't
   // "Finished"
   if (msg->msg_type != SSL3_MT_FINISHED)
     {
@@ -745,7 +744,7 @@ tls_session_send_client_hello (TlsSession *self, GError **error)
   written &= fpi_byte_writer_put_uint16_be (&writer, self->suites_size);
   written &= fpi_byte_writer_put_data (&writer, self->suites, self->suites_size);
 
-  // BROKEN The windows driver doesn't advertise the NULL compression method
+  // nonstandard: The windows driver doesn't advertise the NULL compression method
   written &= fpi_byte_writer_put_uint8 (&writer, 0);
 
   g_autofree guint8 *serialized_extensions = NULL;
@@ -771,8 +770,7 @@ tls_session_send_client_hello (TlsSession *self, GError **error)
       bin2hex (serialized_extensions, serialized_extensions_size);
   g_autofree gchar *suites_str = bin2hex (self->suites, self->suites_size);
 
-  ASPRINTF_ERROR_CHECK (
-      msg->repr,
+  msg->repr = g_strdup_printf (
       "ClientHello(ver=0x%04x, rand=%s, ses_id=%s, cipher_suites=%s, "
       "compr_methods=[], extensions=%s)",
       self->version, rand_str, ses_id_str, suites_str, extensions_str);
@@ -804,7 +802,7 @@ tls_session_send_finished (TlsSession *self, guint8 *verify_data, GError **error
   msg->length = fpi_byte_writer_get_pos (&writer);
   msg->body = fpi_byte_writer_reset_and_get_data (&writer);
   g_autofree gchar *verify_data_str = bin2hex (verify_data, VERIFY_DATA_SIZE);
-  ASPRINTF_ERROR_CHECK (msg->repr, "Finished(verify_data=%s)", verify_data_str);
+  msg->repr = g_strdup_printf ("Finished(verify_data=%s)", verify_data_str);
 
   if (!tls_session_send_handshake_msg (self, msg, &local_error))
     {
@@ -825,14 +823,14 @@ tls_session_send_certificate (TlsSession *self, GError **error)
   fpi_byte_writer_init (&writer);
 
   // TlsHandshakeCertificate
-  written &= fpi_byte_writer_put_uint24_be (&writer, CERTIFICATE_SIZE);
-
+  // nonstandard: The windows driver's length omits the 3 byte TlsCertificate header
+  written &= fpi_byte_writer_put_uint24_be (&writer, self->client_cert_len);
   // TlsCertificate
-  // BROKEN The windows driver has two garbage bytes after the length field
-  written &= fpi_byte_writer_put_uint24_be (&writer, CERTIFICATE_SIZE);
+  // nonstandard: The windows driver has two garbage bytes after the length field
+  written &= fpi_byte_writer_put_uint24_be (&writer, self->client_cert_len);
   written &= fpi_byte_writer_fill (&writer, 0, 2); // Garbage
-  written &= fpi_byte_writer_put_data (
-      &writer, self->pairing_data->client_cert_raw, CERTIFICATE_SIZE);
+  written &= fpi_byte_writer_put_data (&writer, self->client_cert,
+                                       self->client_cert_len);
 
   RETURN_FALSE_AND_SET_ERROR_IF_NOT_WRITTEN (written);
 
@@ -842,10 +840,9 @@ tls_session_send_certificate (TlsSession *self, GError **error)
   msg->length = fpi_byte_writer_get_pos (&writer);
   msg->body = fpi_byte_writer_reset_and_get_data (&writer);
 
-  g_autofree gchar *cert_str =
-      bin2hex (self->pairing_data->server_cert_raw, CERTIFICATE_SIZE);
-  ASPRINTF_ERROR_CHECK (msg->repr, "Certificate(cert=TlsCertificate(data=%s))",
-                        cert_str);
+  g_autofree gchar *cert_str = bin2hex (self->client_cert, self->client_cert_len);
+  msg->repr = g_strdup_printf ("Certificate(cert=TlsCertificate(data=%s))",
+                               cert_str);
 
   if (!tls_session_send_handshake_msg (self, msg, &local_error))
     {
@@ -870,7 +867,7 @@ tls_session_send_client_key_exchange (TlsSession *self,
   msg->length = key_len;
   msg->body = key;
   g_autofree gchar *key_str = bin2hex (key, key_len);
-  ASPRINTF_ERROR_CHECK (msg->repr, "ClientKeyExchange(data=%s)", key_str);
+  msg->repr = g_strdup_printf ("ClientKeyExchange(data=%s)", key_str);
 
   if (!tls_session_send_handshake_msg (self, msg, &local_error))
     {
@@ -903,8 +900,8 @@ tls_session_send_certificate_verify (TlsSession *self,
   msg->body = fpi_byte_writer_reset_and_get_data (&writer);
 
   g_autofree gchar *sign_str = bin2hex (signature, signature_len);
-  ASPRINTF_ERROR_CHECK (msg->repr, "CertificateVerify(signed_hash=%s)",
-                        sign_str);
+  msg->repr = g_strdup_printf ("CertificateVerify(signed_hash=%s)",
+                               sign_str);
 
   if (!tls_session_send_handshake_msg (self, msg, &local_error))
     {
@@ -933,11 +930,13 @@ tls_session_send_change_cipher_spec (TlsSession *self,
   record->type = SSL3_RT_CHANGE_CIPHER_SPEC;
   record->length = fpi_byte_writer_get_pos (&writer);
   record->fragment = fpi_byte_writer_reset_and_get_data (&writer);
-  ASPRINTF_ERROR_CHECK (record->repr, "ChangeCipherSpec()");
+  record->repr = g_strdup_printf ("ChangeCipherSpec()");
 
-  tls_session_send (self, record, &local_error);
-  if (local_error)
-    g_propagate_error (error, local_error);
+  if (!tls_session_send (self, record, &local_error))
+    {
+      g_propagate_error (error, local_error);
+      return FALSE;
+    }
 
   if (!tls_session_flush_content_buffer (self, &local_error))
     {
@@ -956,7 +955,7 @@ tls_session_receive_handshake (TlsSession *self, Handshake *msg, GError **error)
   gboolean read_ok = TRUE;
 
   // Update hash
-  // BROKEN The windows driver only updates it when the message isn't "Finished"
+  // nonstandard: The windows driver only updates it when the message isn't "Finished"
   if (msg->msg_type != SSL3_MT_FINISHED)
     {
       gboolean written = TRUE;
@@ -1005,12 +1004,35 @@ tls_session_receive_handshake (TlsSession *self, Handshake *msg, GError **error)
 
         RETURN_FALSE_AND_SET_ERROR_IF_NOT_READ (read_ok);
 
-        g_assert (session_id_len <= MAX_SESSION_ID_SIZE);
+        if (session_id_len > MAX_SESSION_ID_SIZE)
+          {
+            self->raised_alert_desc = SSL_AD_ILLEGAL_PARAMETER;
+            g_propagate_error (error, fpi_device_error_new_msg (
+                                          FP_DEVICE_ERROR_PROTO,
+                                          "Received oversized TLS session id of len: %u",
+                                          session_id_len));
+            return FALSE;
+          }
 
+        if (self->session_id_size == session_id_len)
+          {
+            // The windows driver does implement (broken) resuming, but it is never
+            // used
+            memcpy (self->session_id, session_id, self->session_id_size);
+          }
+        else
+          {
+#ifdef DEBUG_SSL
+            fp_dbg ("Received session_id of differing size: %u", session_id_len);
+#endif
+            self->session_id_size = session_id_len;
+            g_clear_pointer (&self->session_id, g_free);
+            self->session_id = g_memdup2 (session_id, session_id_len);
+          }
+
+#ifdef DEBUG_SSL
         g_autofree gchar *ses_id_str = bin2hex (session_id, session_id_len);
         g_autofree gchar *rand_str = bin2hex (random, RANDOM_SIZE);
-
-#if DEBUG_SSL
         fp_dbg (
             "<- HandshakeMessage(type=0x%02x, "
             "content=ServerHello(ver=0x%04x, rand=%s, ses_id='%s', "
@@ -1021,10 +1043,6 @@ tls_session_receive_handshake (TlsSession *self, Handshake *msg, GError **error)
 
         // Store server random
         memcpy (self->server_random, random, RANDOM_SIZE);
-
-        // The windows driver does implement (broken) resuming, but it is never
-        // used
-        memcpy (self->session_id, session_id, session_id_len);
 
         if (cipher_suite != TLS_ECDH_ECDSA_WITH_AES_256_GCM_SHA384)
           {
@@ -1097,7 +1115,7 @@ tls_session_receive_handshake (TlsSession *self, Handshake *msg, GError **error)
             return FALSE;
           }
 
-#if DEBUG_SSL
+#ifdef DEBUG_SSL
         fp_dbg (
             "<- HandshakeMessage(type=0x%02x, "
             "content=CertificateRequest(types=[%d]))",
@@ -1119,7 +1137,7 @@ tls_session_receive_handshake (TlsSession *self, Handshake *msg, GError **error)
             return FALSE;
           }
 
-#if DEBUG_SSL
+#ifdef DEBUG_SSL
         fp_dbg ("<- HandshakeMessage(type=0x%02x, content=ServerHelloDone())",
                 msg->msg_type);
 #endif
@@ -1176,7 +1194,7 @@ tls_session_receive_handshake (TlsSession *self, Handshake *msg, GError **error)
 
         if (ctx == NULL ||
             !EVP_DigestSignInit (ctx, NULL, EVP_sha256 (), NULL,
-                                 self->pairing_data->client_key) ||
+                                 self->client_key) ||
             !EVP_DigestSignUpdate (ctx, hdata, hdata_len) ||
             !EVP_DigestSignFinal (ctx, NULL, &signature_len))
           {
@@ -1215,7 +1233,7 @@ tls_session_receive_handshake (TlsSession *self, Handshake *msg, GError **error)
 
         if (ctx == NULL || !EVP_PKEY_derive_init (pctx) ||
             !EVP_PKEY_derive_set_peer (pctx,
-                                       self->pairing_data->server_cert.pub_key) ||
+                                       self->server_pub_key) ||
             !EVP_PKEY_derive (pctx, NULL, &premaster_secret_len))
           {
             g_propagate_error (error, fpi_device_error_new_msg (
@@ -1260,7 +1278,7 @@ tls_session_receive_handshake (TlsSession *self, Handshake *msg, GError **error)
         label = "key expansion";
         if (!tls_prf (self->master_secret, MASTER_SECRET_SIZE, label,
                       strlen (label), rnd, sizeof (rnd), key_block,
-                      MAX_KEY_BLOCK_SIZE, self->hash_algo, NULL))
+                      MAX_KEY_BLOCK_SIZE, self->hash_algo, &local_error))
           {
             g_propagate_error (error, local_error);
             return FALSE;
@@ -1350,7 +1368,7 @@ tls_session_receive_handshake (TlsSession *self, Handshake *msg, GError **error)
                                              &server_verify_data);
         RETURN_FALSE_AND_SET_ERROR_IF_NOT_READ (read_ok);
 
-#if DEBUG_SSL
+#ifdef DEBUG_SSL
         g_autofree gchar *verify_data_str =
             bin2hex (server_verify_data, VERIFY_DATA_SIZE);
         fp_dbg (
@@ -1390,6 +1408,7 @@ tls_session_receive_handshake (TlsSession *self, Handshake *msg, GError **error)
         // The handshake is now done
         self->handshake_phase = FINISHED;
       }
+      break;
     }
 
   return TRUE;
@@ -1411,7 +1430,7 @@ tls_session_receive (TlsSession *self, TlsRecord *record, GError **error)
         {
         case SSL3_RT_CHANGE_CIPHER_SPEC:
           {
-#if DEBUG_SSL
+#ifdef DEBUG_SSL
             fp_dbg ("<- ChangeCipherSpec");
 #endif
 
@@ -1452,7 +1471,7 @@ tls_session_receive (TlsSession *self, TlsRecord *record, GError **error)
                 return FALSE;
               }
 
-#if DEBUG_SSL
+#ifdef DEBUG_SSL
             fp_dbg ("<- TlsAlert(level=\"%s\", description=\"%s\")",
                     alert_level == SSL3_AL_WARNING ? "warning" : "fatal",
                     SSL_alert_desc_string_long (alert_description));
@@ -1490,12 +1509,12 @@ tls_session_receive (TlsSession *self, TlsRecord *record, GError **error)
                 g_propagate_error (error, local_error);
                 return FALSE;
               }
-            *error = fpi_device_error_new_msg (
-                FP_DEVICE_ERROR_PROTO,
-                "Unexpected recieval of TLS alert message: level=\"%s\", "
-                "description = \"%s\"",
-                alert_level == SSL3_AL_WARNING ? "warning" : "fatal",
-                SSL_alert_desc_string_long (alert_description));
+            g_propagate_error (error, set_and_report_error (
+                                          FP_DEVICE_ERROR_PROTO,
+                                          "Unexpected recieval of TLS alert message: level=\"%s\", "
+                                          "description = \"%s\"",
+                                          alert_level == SSL3_AL_WARNING ? "warning" : "fatal",
+                                          SSL_alert_desc_string_long (alert_description)));
             return FALSE;
             break;
           }
@@ -1522,9 +1541,9 @@ tls_session_receive (TlsSession *self, TlsRecord *record, GError **error)
             const guint8 *app_data = NULL;
 
             app_data_size = fpi_byte_reader_get_remaining (&reader);
-            read_ok = fpi_byte_reader_get_data (&reader, app_data_size, &app_data);
+            fpi_byte_reader_get_data (&reader, app_data_size, &app_data);
 
-#if DEBUG_SSL
+#ifdef DEBUG_SSL
             g_autofree gchar *app_data_str = bin2hex (app_data, app_data_size);
             fp_dbg ("<- ApplicationData(data=%s)", app_data_str);
 #endif
@@ -1555,7 +1574,13 @@ tls_session_receive_ciphertext (TlsSession *self, guint8 *data, gsize size, GErr
   FpiByteReader reader;
   gboolean read_ok = TRUE;
 
-  g_assert (!self->recv_closed);
+  if (self->recv_closed)
+    {
+      g_propagate_error (error, fpi_device_error_new_msg (
+                                    FP_DEVICE_ERROR_PROTO,
+                                    "Cannot receive ciphertext when closed"));
+      return FALSE;
+    }
 
   fpi_byte_reader_init (&reader, data, size);
   while ((fpi_byte_reader_get_remaining (&reader) != 0) && read_ok)
@@ -1581,12 +1606,16 @@ tls_session_receive_ciphertext (TlsSession *self, guint8 *data, gsize size, GErr
                          FP_DEVICE_ERROR_PROTO,
                          "Received invalid ciphertext version: %d", version));
           self->raised_alert_desc = SSL_AD_PROTOCOL_VERSION;
-          return FALSE;
+          goto raised;
         }
 
       // Read TlsCiphertext and convert to plaintext
-      tls_session_decrypt (self, content_type, version, cfrag, cfrag_size, &pfrag,
-                           &pfrag_size, &local_error);
+      if (!tls_session_decrypt (self, content_type, version, cfrag, cfrag_size, &pfrag,
+                                &pfrag_size, &local_error))
+        {
+          g_propagate_error (error, local_error);
+          return FALSE;
+        }
 
       TlsRecord plaintext = { .type = content_type,
                               .version = self->version,
@@ -1596,11 +1625,20 @@ tls_session_receive_ciphertext (TlsSession *self, guint8 *data, gsize size, GErr
       if (!tls_session_receive (self, &plaintext, &local_error))
         {
           g_propagate_error (error, local_error);
-          return FALSE;
+          goto raised;
         }
     }
 
   return TRUE;
+
+raised:
+  if (self->raised_alert_desc != TLS_NO_ALERT)
+    {
+      fp_warn ("TLS protocol error, alert: %s", SSL_alert_desc_string_long (self->raised_alert_desc));
+      self->recv_closed = TRUE;
+      self->raised_alert_desc = TLS_NO_ALERT;
+    }
+  return FALSE;
 }
 
 gboolean
@@ -1641,20 +1679,27 @@ tls_session_establish (TlsSession *self, GError **error)
 }
 
 TlsSession *
-tls_session_new (void)
+tls_session_new (const guint8 *client_cert, gsize client_cert_len,
+                 EVP_PKEY *client_key, EVP_PKEY *server_pub_key)
 {
-  TlsSession *new = g_new0 (TlsSession, 1);
+  g_return_val_if_fail (client_cert != NULL && client_cert_len > 0, NULL);
+  g_return_val_if_fail (client_key != NULL && server_pub_key != NULL, NULL);
+
+  TlsSession *self = g_new0 (TlsSession, 1);
+
+  self->client_cert = g_memdup2 (client_cert, client_cert_len);
+  self->client_cert_len = client_cert_len;
+  EVP_PKEY_up_ref (client_key);
+  self->client_key = client_key;
+  EVP_PKEY_up_ref (server_pub_key);
+  self->server_pub_key = server_pub_key;
 
   // The windows client always sends a 7 byte session id
-  new->session_id_size = 7;
-  new->session_id = g_malloc0 (7);
+  self->session_id_size = 7;
+  self->session_id = g_malloc0 (7);
 
-  return new;
-}
+  self->raised_alert_desc = TLS_NO_ALERT;
 
-gboolean
-tls_session_init (TlsSession *self, SensorPairingData *pairing_data, GError **error)
-{
   RAND_bytes (self->client_random, RANDOM_SIZE);
 
   self->version = TLS1_2_VERSION;
@@ -1685,14 +1730,12 @@ tls_session_init (TlsSession *self, SensorPairingData *pairing_data, GError **er
   self->client_cs = TLS_NULL_WITH_NULL_NULL;
   self->pending_cs = TLS_NULL_WITH_NULL_NULL;
 
-  self->pairing_data = pairing_data;
-
   fpi_byte_writer_init (&self->handshake_buffer);
   fpi_byte_writer_init (&self->send_buffer);
   fpi_byte_writer_init (&self->content_buffer);
   fpi_byte_writer_init (&self->application_data);
 
-  return TRUE;
+  return self;
 }
 
 static gboolean
@@ -1709,7 +1752,7 @@ tls_session_send_application_data (TlsSession *self,
   record->length = length;
   record->fragment = g_memdup2 (data, length);
   g_autofree gchar *data_str = bin2hex (data, length);
-  ASPRINTF_ERROR_CHECK (record->repr, "ApplicationData(data=%s)", data_str);
+  record->repr = g_strdup_printf ("ApplicationData(data=%s)", data_str);
 
   if (!tls_session_send (self, record, &local_error))
     {
@@ -1760,205 +1803,4 @@ tls_session_unwrap (TlsSession *self, guint8 *cdata, gsize cdata_size, guint8 **
   fpi_byte_writer_init (&self->application_data);
 
   return TRUE;
-}
-
-static gboolean
-generate_hs_priv_key (EVP_PKEY **hs_privkey, GError **error)
-{
-  guint8 secret[] = { 0x71, 0x7c, 0xd7, 0x2d, 0x09, 0x62, 0xbc, 0x4a,
-                      0x28, 0x46, 0x13, 0x8d, 0xbb, 0x2c, 0x24, 0x19 };
-  guint8 seed[] = { 0x25, 0x12, 0xa7, 0x64, 0x07, 0x06, 0x5f, 0x38, 0x38,
-                    0x46, 0x13, 0x9d, 0x4b, 0xec, 0x20, 0x33, 0xaa, 0xaa };
-  const gchar *label = "HS_KEY_PAIR_GEN";
-
-  guint8 privkey_k[ECC_KEY_SIZE];
-  if (!tls_prf (secret, sizeof (secret), label, strlen (label), seed, sizeof (seed),
-                privkey_k, ECC_KEY_SIZE, SN_sha256, error))
-    {
-      return FALSE;
-    }
-
-  /* output is in little-endian, OpenSSL expects big-endian */
-  reverse_array (privkey_k, ECC_KEY_SIZE);
-
-#ifdef DEBUG_SSL
-  /* NOTE: expected result (HS_KEY_PAIR_GEN), then converted to big-endian as
-   * expected by OpenSSL
-   * guint8 k[ECC_KEY_SIZE] = {0xe8, 0xa2, 0xa2, 0xb6, 0x65, 0x62, 0x54, 0xd6,
-   * 0xac, 0xb0, 0xef, 0x47, 0x9c, 0xae, 0x41, 0x40, 0xc7, 0xe8, 0xe2, 0x60,
-   * 0xdb, 0x3f, 0x64, 0x2e, 0x35, 0xd4, 0x09, 0x9c, 0x01, 0xb3, 0x6a, 0x86};
-   */
-  g_autofree char *privkey_k_str = bin2hex (privkey_k, ECC_KEY_SIZE);
-  fp_dbg ("Generated hs privkey k param: %s", privkey_k_str);
-#endif
-
-  g_autoptr (OSSL_PARAM_BLD) param_bld = OSSL_PARAM_BLD_new ();
-  g_autoptr (BIGNUM) k_bn = BN_bin2bn (privkey_k, ECC_KEY_SIZE, NULL);
-
-  if (param_bld == NULL ||
-      !OSSL_PARAM_BLD_push_utf8_string (param_bld, "group", "prime256v1", 0) ||
-      !OSSL_PARAM_BLD_push_BN (param_bld, "priv", k_bn))
-    {
-      g_propagate_error (error,
-                         set_and_report_error (
-                             FP_DEVICE_ERROR_GENERAL,
-                             "Failed to generate OSSL builder for private key: %s",
-                             ERR_error_string (ERR_get_error (), NULL)));
-      return FALSE;
-    }
-
-  g_autoptr (OSSL_PARAM) params = OSSL_PARAM_BLD_to_param (param_bld);
-  g_autoptr (EVP_PKEY_CTX) ctx = EVP_PKEY_CTX_new_from_name (NULL, "EC", NULL);
-
-  if (ctx == NULL || params == NULL || !EVP_PKEY_fromdata_init (ctx) ||
-      !EVP_PKEY_fromdata (ctx, hs_privkey, EVP_PKEY_KEYPAIR, params))
-    {
-      g_propagate_error (
-          error, set_and_report_error (FP_DEVICE_ERROR_GENERAL,
-                                       "Failed to load hs private key: %s",
-                                       ERR_error_string (ERR_get_error (), NULL)));
-      return FALSE;
-    }
-
-  return TRUE;
-}
-
-gboolean
-create_host_certificate (EVP_PKEY *server_key,
-                         guint8 **host_certificate_bytes,
-                         GError **error)
-{
-  *host_certificate_bytes = g_malloc (CERTIFICATE_SIZE);
-
-  // get x public key coordinate
-  g_autoptr (BIGNUM) x_bn = BN_new ();
-  if (EVP_PKEY_get_bn_param (server_key, OSSL_PKEY_PARAM_EC_PUB_X, &x_bn) != 1)
-    {
-      g_propagate_error (
-          error, set_and_report_error (
-                     FP_DEVICE_ERROR_GENERAL,
-                     "OpenSSL error while getting x coordinate of public key: %s",
-                     ERR_error_string (ERR_get_error (), NULL)));
-      return FALSE;
-    }
-
-  gsize x_bytes_size = BN_num_bytes (x_bn);
-  g_autofree guint8 *x_bytes = g_malloc (x_bytes_size);
-  g_assert (BN_bn2bin (x_bn, x_bytes) == x_bytes_size);
-
-  // get y public key coordinate
-  g_autoptr (BIGNUM) y_bn = BN_new ();
-  if (EVP_PKEY_get_bn_param (server_key, OSSL_PKEY_PARAM_EC_PUB_Y, &y_bn) != 1)
-    {
-      g_propagate_error (
-          error, set_and_report_error (
-                     FP_DEVICE_ERROR_GENERAL,
-                     "OpenSSL error while getting y coordinate of public key: %s",
-                     ERR_error_string (ERR_get_error (), NULL)));
-      return FALSE;
-    }
-  gsize y_bytes_size = BN_num_bytes (y_bn);
-  g_autofree guint8 *y_bytes = g_malloc (y_bytes_size);
-  g_assert (BN_bn2bin (y_bn, y_bytes) == y_bytes_size);
-
-  FpiByteWriter writer;
-  fpi_byte_writer_init_with_data (&writer, *host_certificate_bytes,
-                                  CERTIFICATE_SIZE, FALSE);
-
-  gboolean written = TRUE;
-  written &= fpi_byte_writer_put_uint16_le (&writer, CERTIFICATE_MAGIC);
-  written &= fpi_byte_writer_put_uint16_le (&writer, CERTIFICATE_CURVE);
-
-  // NOTE: everything is written in little endian -> reverse some things
-  // write x public key coordinate
-  reverse_array (x_bytes, x_bytes_size);
-  written &= fpi_byte_writer_put_data (&writer, x_bytes, x_bytes_size);
-  /* add zeros as padding */
-  written &=
-      fpi_byte_writer_fill (&writer, 0, CERTIFICATE_MAX_KEY_SIZE - x_bytes_size);
-
-  // write y public key coordinate
-  reverse_array (y_bytes, y_bytes_size);
-  written &= fpi_byte_writer_put_data (&writer, y_bytes, y_bytes_size);
-  /* add zeros as padding */
-  written &=
-      fpi_byte_writer_fill (&writer, 0, CERTIFICATE_MAX_KEY_SIZE - y_bytes_size);
-
-  /* add padding */
-  written &= fpi_byte_writer_put_uint8 (&writer, 0);
-  /* put certificate type */
-  written &= fpi_byte_writer_put_uint8 (&writer, 0);
-
-  g_assert (fpi_byte_writer_get_pos (&writer) == CERTIFICATE_DATA_SIZE);
-  RETURN_FALSE_AND_SET_ERROR_IF_NOT_WRITTEN (written);
-
-  g_autoptr (EVP_PKEY) hs_privkey = NULL;
-  if (!generate_hs_priv_key (&hs_privkey, error))
-    {
-      return FALSE;
-    }
-
-  g_autoptr (EVP_MD_CTX) ctx = EVP_MD_CTX_new ();
-  gsize signature_size = 0;
-
-  if (ctx == NULL ||
-      !EVP_DigestSignInit (ctx, NULL, EVP_sha256 (), NULL, hs_privkey) ||
-      !EVP_DigestSignUpdate (ctx, *host_certificate_bytes,
-                             CERTIFICATE_DATA_SIZE) ||
-      !EVP_DigestSignFinal (ctx, NULL, &signature_size))
-    {
-      g_propagate_error (error,
-                         fpi_device_error_new_msg (
-                             FP_DEVICE_ERROR_GENERAL,
-                             "OpenSSL error occured while getting signature "
-                             "length of certificate data: %s",
-                             ERR_error_string (ERR_get_error (), NULL)));
-      return FALSE;
-    }
-
-  g_assert (signature_size <= SIGNATURE_SIZE);
-
-  g_autofree guint8 *signature = g_malloc (signature_size);
-
-  if (!EVP_DigestSignFinal (ctx, signature, &signature_size))
-    {
-      g_propagate_error (error, fpi_device_error_new_msg (
-                                    FP_DEVICE_ERROR_GENERAL,
-                                    "OpenSSL error occured while siging "
-                                    "handshake sent messages hash: %s",
-                                    ERR_error_string (ERR_get_error (), NULL)));
-      return FALSE;
-    }
-
-  written &= fpi_byte_writer_put_uint16_le (&writer, signature_size);
-
-  written &= fpi_byte_writer_put_data (&writer, signature, signature_size);
-  /* add zeros as padding */
-  written &= fpi_byte_writer_fill (&writer, 0, SIGNATURE_SIZE - signature_size);
-  RETURN_FALSE_AND_SET_ERROR_IF_NOT_WRITTEN (written);
-  g_assert (fpi_byte_writer_get_pos (&writer) == CERTIFICATE_SIZE);
-
-#ifdef DEBUG_SSL
-  g_autofree char *host_certificate_str =
-      bin2hex (*host_certificate_bytes, CERTIFICATE_SIZE);
-  fp_dbg ("Genereted host certificate: %s", host_certificate_str);
-#endif
-
-  return TRUE;
-}
-
-void
-free_pairing_data (SensorPairingData *pairing_data)
-{
-  g_clear_pointer (&pairing_data->server_cert_raw, g_free);
-  g_clear_pointer (&pairing_data->server_cert.sign, g_free);
-  g_clear_pointer (&pairing_data->server_cert.x, g_free);
-  g_clear_pointer (&pairing_data->server_cert.y, g_free);
-  g_clear_pointer (&pairing_data->client_cert_raw, g_free);
-  g_clear_pointer (&pairing_data->client_cert.sign, g_free);
-  g_clear_pointer (&pairing_data->client_cert.x, g_free);
-  g_clear_pointer (&pairing_data->client_cert.y, g_free);
-  g_clear_pointer (&pairing_data->client_cert.pub_key, EVP_PKEY_free);
-  g_clear_pointer (&pairing_data->server_cert.pub_key, EVP_PKEY_free);
-  g_clear_pointer (&pairing_data->client_key, EVP_PKEY_free);
 }

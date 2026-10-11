@@ -146,7 +146,8 @@ driver_sources = {
     'synaptics' :
         [ 'drivers/synaptics/synaptics.c', 'drivers/synaptics/bmkt_message.c' ],
     'synatlsmoc' :
-        [ 'drivers/synatlsmoc/synatlsmoc.c',
+        [ 'drivers/synatlsmoc/pairing.c',
+          'drivers/synatlsmoc/synatlsmoc.c',
           'drivers/synatlsmoc/tagval.c',
           'drivers/synatlsmoc/tls_session.c',
           'drivers/synatlsmoc/utils.c' ],

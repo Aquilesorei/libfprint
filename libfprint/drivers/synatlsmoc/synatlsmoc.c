@@ -40,6 +40,7 @@
 #include "fpi-log.h"
 #include "fpi-ssm.h"
 #include "fpi-usb-transfer.h"
+#include "pairing.h"
 #include "sample_pairing_data.h"
 #include "sensor_public_keys.h"
 #include "synatlsmoc.h"
@@ -48,9 +49,9 @@
 #include "utils.h"
 
 /* Some important notes for this driver */
-/* WARN: this driver may not work (cannot test it), if the sensor is not once
- * initialized in Windows */
 /* WARN: current implementation starts a new TLS session on each device open */
+/* NOTE: we do not know if TLS per RFC works, but likely not per the behaviour
+ *  of the Windows driver */
 
 // #define DEBUG
 
@@ -58,8 +59,8 @@
  * pairing data */
 // #define USE_SAMPLE_PAIRING_DATA
 
-guint8 cache_tuid[] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+static guint8 cache_tuid[] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                               0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
 typedef void (*CmdCallback) (FpDevice *device, guchar *buffer_in, gsize length_in, GError *error);
 
@@ -93,7 +94,9 @@ struct _FpiDeviceSynaTlsMoc
 
   guint16 event_seq_num;
   guint32 event_mask;
+  guint32 pending_event_mask;
   guint32 event_recv;
+  guint32 first_event;
   guint num_pending_events;
   gboolean event_read_in_legacy_mode;
 
@@ -269,8 +272,6 @@ synatlsmoc_verify_sensor_certificate (FpiDeviceSynaTlsMoc *self)
       return;
     }
 
-  EVP_PKEY_free (ssm_data->pub_key);
-
 #ifdef DEBUG
   fp_dbg ("Sensor certificate is valid");
 #endif
@@ -279,25 +280,34 @@ synatlsmoc_verify_sensor_certificate (FpiDeviceSynaTlsMoc *self)
 }
 
 static gboolean
-sensor_certificate_from_raw (Certificate *self, guint8 *data, gsize len, GError **error)
+sensor_certificate_from_raw (Certificate *self, const guint8 data[CERTIFICATE_SIZE],
+                             GError **error)
 {
   GError *local_error = NULL;
   gboolean read_ok = TRUE;
   FpiByteReader reader;
 
-  if (len != CERTIFICATE_SIZE)
+  fpi_byte_reader_init (&reader, data, CERTIFICATE_SIZE);
+
+  read_ok &= fpi_byte_reader_get_uint16_le (&reader, &self->magic);
+  read_ok &= fpi_byte_reader_get_uint16_le (&reader, &self->curve);
+
+  RETURN_FALSE_AND_SET_ERROR_IF_NOT_READ (read_ok);
+
+  if (self->magic != CERTIFICATE_MAGIC || self->curve != CERTIFICATE_CURVE)
     {
       g_propagate_error (
           error,
           set_and_report_error (FP_DEVICE_ERROR_PROTO,
-                                "Certificate with incorrect length: %lu", len));
+                                "Unsupported certificate: magic=0x%04x, curve=0x%04x", self->magic, self->curve));
       return FALSE;
     }
 
-  fpi_byte_reader_init (&reader, data, len);
+  g_clear_pointer (&self->x, g_free);
+  g_clear_pointer (&self->y, g_free);
+  g_clear_pointer (&self->sign, g_free);
+  g_clear_pointer (&self->pub_key, EVP_PKEY_free);
 
-  read_ok &= fpi_byte_reader_get_uint16_le (&reader, &self->magic);
-  read_ok &= fpi_byte_reader_get_uint16_le (&reader, &self->curve);
   read_ok &= fpi_byte_reader_dup_data (&reader, ECC_KEY_SIZE, &self->x);
   read_ok &= fpi_byte_reader_skip (&reader, 36);
   read_ok &= fpi_byte_reader_dup_data (&reader, ECC_KEY_SIZE, &self->y);
@@ -305,20 +315,19 @@ sensor_certificate_from_raw (Certificate *self, guint8 *data, gsize len, GError 
   read_ok &= fpi_byte_reader_skip (&reader, 1);
   read_ok &= fpi_byte_reader_get_uint8 (&reader, &self->cert_type);
   read_ok &= fpi_byte_reader_get_uint16_le (&reader, &self->sign_size);
-  read_ok &= fpi_byte_reader_dup_data (&reader, 256, &self->sign);
+  read_ok &= fpi_byte_reader_dup_data (&reader, CERTIFICATE_MAX_SIGN_SIZE, &self->sign);
 
-  if (self->magic != CERTIFICATE_MAGIC || self->curve != CERTIFICATE_CURVE)
+  // This should have no way of failing
+  RETURN_FALSE_AND_SET_ERROR_IF_NOT_READ (read_ok);
+
+  if (self->sign_size > CERTIFICATE_MAX_SIGN_SIZE)
     {
-      g_propagate_error (error,
-                         set_and_report_error (
-                             FP_DEVICE_ERROR_PROTO,
-                             "Unsupported certificate: magic=0x%04x, curve=0x%02x",
-                             self->magic, self->curve));
+      g_propagate_error (
+          error, set_and_report_error (FP_DEVICE_ERROR_PROTO,
+                                       "Certificate signature too long: %u",
+                                       self->sign_size));
       return FALSE;
     }
-
-  // This should have no way of failing though
-  RETURN_FALSE_AND_SET_ERROR_IF_NOT_READ (read_ok);
 
   /* the keys are stored in little endian - reverse them as OpenSSL expects big
    * endian */
@@ -363,7 +372,7 @@ parse_certificates_within_self (FpiDeviceSynaTlsMoc *self,
   GError *local_error = NULL;
   if (!sensor_certificate_from_raw (
           &self->pairing_data.client_cert, self->pairing_data.client_cert_raw,
-          self->pairing_data.client_cert_len, &local_error))
+          &local_error))
     {
       g_propagate_error (
           error, set_and_report_error (FP_DEVICE_ERROR_PROTO,
@@ -374,7 +383,7 @@ parse_certificates_within_self (FpiDeviceSynaTlsMoc *self,
 
   if (!sensor_certificate_from_raw (
           &self->pairing_data.server_cert, self->pairing_data.server_cert_raw,
-          self->pairing_data.server_cert_len, &local_error))
+          &local_error))
     {
       g_propagate_error (
           error, set_and_report_error (FP_DEVICE_ERROR_PROTO,
@@ -708,6 +717,7 @@ fpi_byte_reader_get_mis_version (FpiByteReader *reader,
   return read_ok;
 }
 
+#ifdef DEBUG
 static void
 fp_dbg_mis_version (MisVersion *mis_version)
 {
@@ -734,6 +744,7 @@ fp_dbg_mis_version (MisVersion *mis_version)
   fp_dbg ("\tDevice type: 0x%x", mis_version->device_type);
   fp_dbg ("\tProvision state: %d", mis_version->provision_state);
 }
+#endif
 
 static void
 recv_get_version (FpDevice *device, guchar *buffer_in, gsize length_in, GError *error)
@@ -750,13 +761,12 @@ recv_get_version (FpDevice *device, guchar *buffer_in, gsize length_in, GError *
     }
 
   FpiByteReader reader;
-  gboolean read_ok = TRUE;
-
-  MisVersion mis_version;
-
   fpi_byte_reader_init (&reader, buffer_in, length_in);
+
+  gboolean read_ok = TRUE;
   /* no need to read status again */
   read_ok &= fpi_byte_reader_skip (&reader, SENSOR_FW_REPLY_STATUS_HEADER_LEN);
+  MisVersion mis_version = { 0 };
   read_ok &= fpi_byte_reader_get_mis_version (&reader, &mis_version);
 
   if (!read_ok)
@@ -875,7 +885,6 @@ send_cmd_to_force_close_sensor_tls_session (
 }
 
 /* VCSFW_CMD_TLS_DATA ====================================================== */
-
 static void
 recv_tls_data (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *error)
 {
@@ -895,6 +904,7 @@ recv_tls_data (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *err
                                        &local_error))
     {
       fpi_ssm_mark_failed (self->task_ssm, local_error);
+      return;
     }
 
   if (tls_session_has_data (self->session))
@@ -905,6 +915,31 @@ recv_tls_data (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *err
     {
       fpi_ssm_next_state (self->task_ssm);
     }
+}
+
+static void
+recv_tls_close_data (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *error)
+{
+#ifdef DEBUG
+  fp_dbg ("Receive TLS handshake close callback");
+#endif
+  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (self->task_ssm, error);
+      return;
+    }
+
+  GError *local_error = NULL;
+  if (!tls_session_receive_ciphertext (self->session, buffer_in, length_in,
+                                       &local_error))
+    {
+      fpi_ssm_mark_failed (self->task_ssm, local_error);
+      return;
+    }
+
+  fpi_ssm_mark_completed (self->task_ssm);
 }
 
 static void
@@ -954,30 +989,30 @@ recv_frame_acquire (FpDevice *device, guint8 *buffer_in, gsize length_in, GError
   else if (status == RESPONSE_PROCESSING_FRAME)
     {
       gint *retry_idx;
+      guint retry_state;
       if (fpi_device_get_current_action (device) == FPI_DEVICE_ACTION_ENROLL)
         {
           EnrollData *enroll_ssm_data = fpi_ssm_get_data (self->task_ssm);
           retry_idx = &enroll_ssm_data->frame_acquire_retry_idx;
+          retry_state = ENROLL_SEND_FRAME_ACQUIRE;
         }
-      else if (fpi_device_get_current_action (device) == FPI_DEVICE_ACTION_VERIFY)
+      else /* VERIFY / IDENTIFY */
         {
           IdentifyVerifyData *identify_verify_ssm_data =
               fpi_ssm_get_data (self->task_ssm);
           retry_idx = &identify_verify_ssm_data->frame_acquire_retry_idx;
-        }
-      else
-        {
-          g_assert_not_reached ();
+          retry_state = IDENTIFY_VERIFY_SEND_FRAME_ACQUIRE;
         }
 
-      if (retry_idx > 0)
+      if ((*retry_idx) > 0)
         {
           *retry_idx -= 1;
 #ifdef DEBUG
           fp_dbg ("Received processing frame; current / max retries: %d/%d ....",
                   *retry_idx, FRAME_ACQUIRE_NUM_RETRIES);
 #endif
-          fpi_ssm_jump_to_state (self->task_ssm, ENROLL_SEND_FRAME_ACQUIRE);
+          fpi_ssm_jump_to_state_delayed (self->task_ssm, retry_state,
+                                         FRAME_ACQUIRE_RETRY_DELAY_MS);
         }
       else
         {
@@ -997,7 +1032,7 @@ recv_frame_acquire (FpDevice *device, guint8 *buffer_in, gsize length_in, GError
 }
 
 static void
-send_frame_acquire (FpiDeviceSynaTlsMoc *self, guint8 capture_flags)
+send_frame_acquire (FpiDeviceSynaTlsMoc *self, guint32 acq_flags)
 {
   const guint send_size = 17;
   const guint expected_recv_size = SENSOR_FW_REPLY_STATUS_HEADER_LEN;
@@ -1010,22 +1045,16 @@ send_frame_acquire (FpiDeviceSynaTlsMoc *self, guint8 capture_flags)
   gboolean written = TRUE;
 
   fpi_byte_writer_init (&writer);
-  /* As there were only two capture flags used, I simplified the request logic
-   * a bit */
   written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_FRAME_ACQ);
-  /* I was unable to find the meaning of these values, so I did not abstract
-   * them into constants */
-  if (capture_flags == CAPTURE_FLAG_AUTH)
-    written &= fpi_byte_writer_put_uint32_le (&writer, 4116);
-  else
-    written &= fpi_byte_writer_put_uint32_le (&writer, 12);
+  written &= fpi_byte_writer_put_uint32_le (&writer, acq_flags);
   written &= fpi_byte_writer_put_uint32_le (&writer, 1); // Number of frames
+  /* Block built as Windows driver does for one finger-triggered frame mode */
   written &= fpi_byte_writer_put_uint16_le (&writer, 1);
   written &= fpi_byte_writer_put_uint8 (&writer, 0);
   written &= fpi_byte_writer_put_uint8 (&writer, 8);
-  written &= fpi_byte_writer_put_uint8 (&writer, 1);
-  written &= fpi_byte_writer_put_uint8 (&writer, 1); // Trigger mode?
-  written &= fpi_byte_writer_put_uint8 (&writer, 1);
+  written &= fpi_byte_writer_put_uint8 (&writer, 1); /* 0 only in N-frame mode */
+  written &= fpi_byte_writer_put_uint8 (&writer, 1); /* trigger: wait for finger */
+  written &= fpi_byte_writer_put_uint8 (&writer, 1); /* 1 only in single-frame mode */
   written &= fpi_byte_writer_put_uint8 (&writer, 0);
 
   FAIL_TASK_SSM_AND_RETURN_IF_NOT_WRITTEN (written);
@@ -1035,7 +1064,7 @@ send_frame_acquire (FpiDeviceSynaTlsMoc *self, guint8 capture_flags)
 
   /* Do not check the response status as there is a status on which we
    * should send the command again */
-  synatlsmoc_exec_cmd (self, FALSE, TRUE, cmd, send_size, expected_recv_size,
+  synatlsmoc_exec_cmd (self, FALSE, FALSE, cmd, send_size, expected_recv_size,
                        recv_frame_acquire);
 }
 
@@ -1093,6 +1122,10 @@ recv_event_config (FpDevice *device, guint8 *buffer_in, gsize length_in, GError 
   fp_dbg ("Current event sequence number: %d", self->event_seq_num);
 #endif
 
+  self->event_mask = self->pending_event_mask;
+  self->event_recv = 0;
+  self->first_event = NO_EVENTS;
+
   fpi_ssm_next_state (self->task_ssm);
 }
 
@@ -1108,24 +1141,20 @@ send_event_config (FpiDeviceSynaTlsMoc *self, guint32 mask)
 #endif
 
   FpiByteWriter writer;
-  gboolean written = TRUE;
-
   fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
+
+  gboolean written = TRUE;
   written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_EVENT_CONFIG);
   for (gint i = 0; i < event_mask_cnt && written; ++i)
-    {
-      written &= fpi_byte_writer_put_uint32_le (&writer, mask);
-    }
-  fpi_byte_writer_put_uint32_le (&writer, mask != 0 ? 0 : 4);
+    written &= fpi_byte_writer_put_uint32_le (&writer, (i % 4 == 0) ? mask : 0);
+  written &= fpi_byte_writer_put_uint32_le (&writer, mask != 0 ? 0 : 4);
 
   FAIL_TASK_SSM_AND_RETURN_IF_NOT_WRITTEN (written);
   FAIL_TASK_SSM_AND_RETURN_ON_WRONG_SEND_SIZE (writer, send_size);
 
   g_autofree guint8 *cmd = fpi_byte_writer_reset_and_get_data (&writer);
 
-  // FIXME: should happen at the end of the callback
-  self->event_mask = mask;
-  self->event_recv = 0;
+  self->pending_event_mask = mask;
 
   synatlsmoc_exec_cmd (self, FALSE, TRUE, cmd, send_size, expected_recv_size,
                        recv_event_config);
@@ -1196,7 +1225,14 @@ recv_event_read (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *e
   /* parse number of pending events */
   if (self->event_read_in_legacy_mode)
     {
-      g_assert (recv_num_pending_events >= recv_num_events);
+      if (recv_num_events > recv_num_pending_events)
+        {
+          fpi_ssm_mark_failed (
+              self->task_ssm, set_and_report_error (FP_DEVICE_ERROR_PROTO,
+                                                    "Number of events pending: %u is greater than number of events: %u",
+                                                    recv_num_pending_events, recv_num_events));
+          return;
+        }
       self->num_pending_events = recv_num_pending_events - recv_num_events;
     }
   else
@@ -1237,7 +1273,19 @@ recv_event_read (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *e
       fp_dbg ("\t\t%d = %s", event_type, event_type_to_str (event_type));
 #endif
 
-      self->event_recv |= (1 << event_type);
+      if (event_type >= 32)
+        {
+          fpi_ssm_mark_failed (self->task_ssm,
+                               set_and_report_error (FP_DEVICE_ERROR_PROTO,
+                                                     "event_type: %u larger than expected", event_type));
+          return;
+        }
+
+
+      guint32 event_bit = 1U << event_type;
+      if ((self->event_mask & event_bit) && (self->first_event == NO_EVENTS))
+        self->first_event = event_bit;
+      self->event_recv |= event_bit;
     }
 
   if (self->num_pending_events > 0)
@@ -1248,7 +1296,7 @@ recv_event_read (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *e
 #endif
       send_event_read (self);
     }
-  else if (self->event_recv == self->event_mask)
+  else if (self->event_recv & self->event_mask)
     {
       fpi_ssm_next_state (self->task_ssm);
     }
@@ -1270,12 +1318,13 @@ send_event_read (FpiDeviceSynaTlsMoc *self)
   const guint send_size = self->event_read_in_legacy_mode ? 5 : 9;
   const guint expected_recv_size = 6 + 12 * max_num_events_in_resp;
 
-  FpiByteWriter writer;
-  gboolean written = TRUE;
 
   g_autofree guint8 *cmd = NULL;
 
+  FpiByteWriter writer;
   fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
+
+  gboolean written = TRUE;
   written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_EVENT_READ);
   written &= fpi_byte_writer_put_uint16_le (&writer, self->event_seq_num);
   written &= fpi_byte_writer_put_uint16_le (&writer, max_num_events_in_resp);
@@ -1316,25 +1365,16 @@ recv_pair (FpDevice *device, guchar *buffer_in, gsize length_in, GError *error)
   /* no need to read status again */
   read_ok &= fpi_byte_reader_skip (&reader, SENSOR_FW_REPLY_STATUS_HEADER_LEN);
 
-  if (read_ok && self->pairing_data.client_cert_raw != 0)
-    {
-      fp_warn ("Overwriting stored client/host certificate");
-      g_free (self->pairing_data.client_cert_raw);
-    }
-  if (read_ok)
-    self->pairing_data.client_cert_len = CERTIFICATE_SIZE;
-  read_ok &= fpi_byte_reader_dup_data (&reader, CERTIFICATE_SIZE,
-                                       &self->pairing_data.client_cert_raw);
+  const guint8 *client_cert_raw = NULL;
+  const guint8 *server_cert_raw = NULL;
+  read_ok &= fpi_byte_reader_get_data (&reader, CERTIFICATE_SIZE, &client_cert_raw);
+  read_ok &= fpi_byte_reader_get_data (&reader, CERTIFICATE_SIZE, &server_cert_raw);
+  FAIL_TASK_SSM_AND_RETURN_IF_NOT_READ (read_ok);
 
-  if (read_ok && self->pairing_data.server_cert_raw != 0)
-    {
-      fp_warn ("Overwriting stored server/sensor certificate");
-      g_free (self->pairing_data.server_cert_raw);
-    }
-  read_ok &= fpi_byte_reader_dup_data (&reader, CERTIFICATE_SIZE,
-                                       &self->pairing_data.server_cert_raw);
-  if (read_ok)
-    self->pairing_data.server_cert_len = CERTIFICATE_SIZE;
+  if (self->pairing_data.client_cert.pub_key != NULL)
+    fp_warn ("Overwriting stored pairing certificates");
+  memcpy (self->pairing_data.client_cert_raw, client_cert_raw, CERTIFICATE_SIZE);
+  memcpy (self->pairing_data.server_cert_raw, server_cert_raw, CERTIFICATE_SIZE);
 
   if (!parse_certificates_within_self (self, &error))
     {
@@ -1373,10 +1413,11 @@ send_pair (FpiDeviceSynaTlsMoc *self,
 #endif
 
   FpiByteWriter writer;
-  gboolean written = TRUE;
   fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
-  fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_PAIR);
-  fpi_byte_writer_put_data (&writer, send_host_cert_bytes, CERTIFICATE_SIZE);
+
+  gboolean written = TRUE;
+  written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_PAIR);
+  written &= fpi_byte_writer_put_data (&writer, send_host_cert_bytes, CERTIFICATE_SIZE);
 
   FAIL_TASK_SSM_AND_RETURN_IF_NOT_WRITTEN (written);
   FAIL_TASK_SSM_AND_RETURN_ON_WRONG_SEND_SIZE (writer, send_size);
@@ -1443,12 +1484,13 @@ send_enroll_start (FpiDeviceSynaTlsMoc *self)
 #endif
 
   FpiByteWriter writer;
-  gboolean written = TRUE;
   fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
-  fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_ENROLL);
-  fpi_byte_writer_put_uint32_le (&writer, ENROLL_SUBCMD_START);
-  fpi_byte_writer_put_uint32_le (&writer, nonce_buffer_size != 0);
-  fpi_byte_writer_put_uint32_le (&writer, nonce_buffer_size);
+
+  gboolean written = TRUE;
+  written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_ENROLL);
+  written &= fpi_byte_writer_put_uint32_le (&writer, ENROLL_SUBCMD_START);
+  written &= fpi_byte_writer_put_uint32_le (&writer, nonce_buffer_size != 0);
+  written &= fpi_byte_writer_put_uint32_le (&writer, nonce_buffer_size);
 
   FAIL_TASK_SSM_AND_RETURN_IF_NOT_WRITTEN (written);
   FAIL_TASK_SSM_AND_RETURN_ON_WRONG_SEND_SIZE (writer, send_size);
@@ -1459,6 +1501,7 @@ send_enroll_start (FpiDeviceSynaTlsMoc *self)
                        recv_enroll_start);
 }
 
+#ifdef DEBUG
 static void
 fp_dbg_enroll_stats (EnrollStats *enroll_stats)
 {
@@ -1472,6 +1515,7 @@ fp_dbg_enroll_stats (EnrollStats *enroll_stats)
   fp_dbg ("\tenroll status: %d", enroll_stats->status);
   fp_dbg ("\t(smt like) has fixed pattern: %d", enroll_stats->has_fixed_pattern);
 }
+#endif
 
 static gboolean
 fpi_byte_reader_get_enroll_stats (FpiByteReader *reader,
@@ -1598,7 +1642,7 @@ recv_add_image (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *er
     }
   else
     {
-      fpi_ssm_jump_to_state (self->task_ssm, ENROLL_SET_EVENT_FINGER_UP);
+      fpi_ssm_jump_to_state (self->task_ssm, ENROLL_SET_EVENT_FINGER_PRESENCE);
     }
 }
 
@@ -1612,9 +1656,9 @@ send_add_image (FpiDeviceSynaTlsMoc *self)
   const guint expected_recv_size = 82;
 
   FpiByteWriter writer;
-  gboolean written = TRUE;
-
   fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
+
+  gboolean written = TRUE;
   written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_ENROLL);
   written &= fpi_byte_writer_put_uint32_le (&writer, ENROLL_SUBCMD_ADD_IMAGE);
 
@@ -1641,9 +1685,9 @@ send_enroll_commit (FpiDeviceSynaTlsMoc *self,
   const guint expected_recv_size = SENSOR_FW_REPLY_STATUS_HEADER_LEN;
 
   FpiByteWriter writer;
-  gboolean written = TRUE;
-
   fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
+
+  gboolean written = TRUE;
   written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_ENROLL);
   written &= fpi_byte_writer_put_uint32_le (&writer, ENROLL_SUBCMD_COMMIT);
   written &= fpi_byte_writer_put_uint32_le (&writer, 0);
@@ -1670,9 +1714,9 @@ send_enroll_finish (FpiDeviceSynaTlsMoc *self)
   const guint expected_recv_size = SENSOR_FW_REPLY_STATUS_HEADER_LEN;
 
   FpiByteWriter writer;
-  gboolean written = TRUE;
-
   fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
+
+  gboolean written = TRUE;
   written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_ENROLL);
   written &= fpi_byte_writer_put_uint32_le (&writer, ENROLL_SUBCMD_FINISH);
 
@@ -1685,7 +1729,7 @@ send_enroll_finish (FpiDeviceSynaTlsMoc *self)
                        synatlsmoc_ssm_next_state_cb);
 }
 
-/* VCSFW_CMD_IDENTIFY_MATCH ================================================ */
+/* VCSFW_CMD_IDENTIFY_WBF ================================================== */
 
 static void
 recv_identify_match (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *error)
@@ -1748,7 +1792,7 @@ recv_identify_match (FpDevice *device, guint8 *buffer_in, gsize length_in, GErro
   g_autofree guint8 *z_data = NULL;
   guint32 match_score;
   guint8 *user_id, *finger_id, *template_id;
-  gsize template_id_size, user_id_size, finger_id_size;
+  gsize template_id_len, user_id_len, finger_id_len;
 
   read_ok &= fpi_byte_reader_skip (&reader, DB2_ID_SIZE);
   read_ok &= fpi_byte_reader_get_uint32_le (&reader, &qm_struct_size);
@@ -1789,24 +1833,35 @@ recv_identify_match (FpDevice *device, guint8 *buffer_in, gsize length_in, GErro
   FAIL_TASK_SSM_AND_RETURN_IF_NOT_READ (read_ok);
 
   g_autoptr (TagVal) tagval = NULL;
-  gboolean tagval_ok = TRUE;
-  tagval_ok &= tagval_new_from_bytes (&tagval, z_data, z_len, &local_error);
-  tagval_ok &= tagval_get (tagval, ENROLL_TAG_TEMPLATE_ID, &template_id,
-                           &template_id_size, &local_error);
-  tagval_ok &= tagval_get (tagval, ENROLL_TAG_USER_ID, &user_id, &user_id_size,
-                           &local_error);
-  tagval_ok &= tagval_get (tagval, ENROLL_TAG_FINGER_ID, &finger_id,
-                           &finger_id_size, &local_error);
-
-  if (!tagval_ok)
+  if (
+      (!tagval_new_from_bytes (&tagval, z_data, z_len, &local_error)) ||
+      (!tagval_get (tagval, ENROLL_TAG_TEMPLATE_ID, &template_id,
+                    &template_id_len, &local_error)) ||
+      (!tagval_get (tagval, ENROLL_TAG_USER_ID, &user_id, &user_id_len,
+                    &local_error)) ||
+      (!tagval_get (tagval, ENROLL_TAG_FINGER_ID, &finger_id, &finger_id_len,
+                    &local_error)))
     {
       fpi_ssm_mark_failed (self->task_ssm, local_error);
       return;
     }
 
-  g_assert (template_id_size == sizeof (Db2Id));
-  g_assert (user_id_size == sizeof (FpUserId));
-  g_assert (finger_id_size == sizeof (FingerId));
+  if (template_id_len != sizeof (Db2Id) ||
+      user_id_len != sizeof (FpUserId) ||
+      finger_id_len != sizeof (FingerId))
+    {
+      fpi_ssm_mark_failed (
+          self->task_ssm,
+          set_and_report_error (
+              FP_DEVICE_ERROR_PROTO,
+              "Unexpected tagval lengths: template=%" G_GSIZE_FORMAT
+              " (expected %" G_GSIZE_FORMAT "), user=%" G_GSIZE_FORMAT
+              " (expected %" G_GSIZE_FORMAT "), finger=%" G_GSIZE_FORMAT
+              " (expected %" G_GSIZE_FORMAT ")",
+              template_id_len, sizeof (Db2Id),
+              user_id_len, sizeof (FpUserId),
+              finger_id_len, sizeof (FingerId)));
+    }
 
   /* Create a new print from template_id, user_id and finger_id and then see
    * if it matches the one indicated */
@@ -1873,16 +1928,16 @@ send_identify_match (FpiDeviceSynaTlsMoc *self,
   gboolean written = TRUE;
 
   fpi_byte_writer_init (&writer);
-  written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_IDENTIFY_MATCH);
+  written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_IDENTIFY_WBF);
   written &=
-      fpi_byte_writer_put_uint32_le (&writer, IDENTIFY_MATCH_SUBCMD_WBF_MATCH);
+      fpi_byte_writer_put_uint32_le (&writer, IDENTIFY_WBF_SUBCMD_MATCH);
   written &= fpi_byte_writer_put_uint32_le (&writer, template_id_array_size);
   written &= fpi_byte_writer_put_uint32_le (&writer, data_2_size);
   if (template_ids_to_match != NULL)
     {
       written &=
           fpi_byte_writer_put_data (&writer, *template_ids_to_match,
-                                    template_id_cnt * template_id_array_size);
+                                    template_id_array_size);
     }
   else if (data_2 != NULL)
     {
@@ -1898,7 +1953,7 @@ send_identify_match (FpiDeviceSynaTlsMoc *self,
                        recv_identify_match);
 }
 
-/* VCSFW_CMD_GET_IMAGE_METRICS ============================================= */
+/* VCSFW_CMD_IMAGE_METRICS ============================================= */
 
 static void
 recv_get_image_metrics (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *error)
@@ -1964,7 +2019,13 @@ recv_get_image_metrics (FpDevice *device, guint8 *buffer_in, gsize length_in, GE
       switch (image_metrics_type)
         {
         case MIS_IMAGE_METRICS_IPL_FINGER_COVERAGE:
-          g_assert (image_metrics_length == 4);
+          if (image_metrics_length != 4)
+            {
+              fpi_ssm_mark_failed (
+                  self->task_ssm,
+                  set_and_report_error (FP_DEVICE_ERROR_PROTO, "Received unexpected length of IPL finger coverage image metrics: %u", image_metrics_length));
+              return;
+            }
 
           guint32 ipl_coverage;
           read_ok &= fpi_byte_reader_get_uint32_le (&reader, &ipl_coverage);
@@ -1975,7 +2036,13 @@ recv_get_image_metrics (FpDevice *device, guint8 *buffer_in, gsize length_in, GE
 #endif
           break;
         case MIS_IMAGE_METRICS_IMG_QUALITY:
-          g_assert (image_metrics_length == 8);
+          if (image_metrics_length != 8)
+            {
+              fpi_ssm_mark_failed (
+                  self->task_ssm,
+                  set_and_report_error (FP_DEVICE_ERROR_PROTO, "Received unexpected length of image quality metrics: %u", image_metrics_length));
+              return;
+            }
 
           guint32 matcher_img_quality, matcher_sensor_coverage;
           read_ok &= fpi_byte_reader_get_uint32_le (&reader, &matcher_img_quality);
@@ -2022,9 +2089,6 @@ send_get_image_metrics (FpiDeviceSynaTlsMoc *self,
   fp_dbg ("Image metrics command");
 #endif
 
-  FpiByteWriter writer;
-  gboolean written = TRUE;
-
   const guint send_size = 5;
   guint expected_recv_size;
 
@@ -2043,8 +2107,11 @@ send_get_image_metrics (FpiDeviceSynaTlsMoc *self,
       break;
     }
 
+  FpiByteWriter writer;
   fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
-  written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_GET_IMAGE_METRICS);
+
+  gboolean written = TRUE;
+  written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_IMAGE_METRICS);
   written &= fpi_byte_writer_put_uint32_le (&writer, type);
 
   FAIL_TASK_SSM_AND_RETURN_IF_NOT_WRITTEN (written);
@@ -2098,6 +2165,7 @@ fpi_byte_reader_get_db2_info (FpiByteReader *reader,
   return read_ok;
 }
 
+#ifdef DEBUG
 static void
 fp_dbg_db2_info (Db2Info *db2_info)
 {
@@ -2121,6 +2189,7 @@ fp_dbg_db2_info (Db2Info *db2_info)
           db2_info->num_current_payloads, db2_info->num_deleted_payloads,
           db2_info->num_available_payload_slots);
 }
+#endif
 
 static void
 recv_db2_get_db2_info (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *error)
@@ -2197,13 +2266,13 @@ get_object_list_recv_size (FpiDeviceSynaTlsMoc *self,
   switch (obj_type)
     {
     case OBJ_TYPE_USERS:
-      return 4 + 16 * data->num_current_users;
+      return 4 + DB2_ID_SIZE * data->num_current_users;
       break;
     case OBJ_TYPE_TEMPLATES:
-      return 4 + 16 * data->num_current_templates;
+      return 4 + DB2_ID_SIZE * data->num_current_templates;
       break;
     case OBJ_TYPE_PAYLOADS:
-      return 4 + 16 * data->num_current_payloads;
+      return 4 + DB2_ID_SIZE * data->num_current_payloads;
       break;
     default:
       fp_err ("Unknown object type: %d", obj_type);
@@ -2248,7 +2317,7 @@ recv_db2_get_template_list (FpDevice *device, guint8 *buffer_in, gsize length_in
   for (int i = 0; i < num_templates && read_ok; i++)
     {
       g_autofree guint8 *template_id = NULL;
-      fpi_byte_reader_dup_data (&reader, DB2_ID_SIZE, &template_id);
+      read_ok &= fpi_byte_reader_dup_data (&reader, DB2_ID_SIZE, &template_id);
 
       FAIL_TASK_SSM_AND_RETURN_IF_NOT_READ (read_ok);
 #ifdef DEBUG
@@ -2305,7 +2374,7 @@ recv_db2_get_payload_list (FpDevice *device, guint8 *buffer_in, gsize length_in,
   for (int i = 0; i < num_payloads && read_ok; i++)
     {
       g_autofree guint8 *payload = NULL;
-      fpi_byte_reader_dup_data (&reader, DB2_ID_SIZE, &payload);
+      read_ok &= fpi_byte_reader_dup_data (&reader, DB2_ID_SIZE, &payload);
 
       FAIL_TASK_SSM_AND_RETURN_IF_NOT_READ (read_ok);
 #ifdef DEBUG
@@ -2352,11 +2421,12 @@ send_db2_get_object_list (FpiDeviceSynaTlsMoc *self,
 #endif
 
   FpiByteWriter writer;
-  gboolean written = TRUE;
   fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
-  fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_DB2_GET_OBJECT_LIST);
-  fpi_byte_writer_put_uint32_le (&writer, obj_type);
-  fpi_byte_writer_put_data (&writer, obj_id, DB2_ID_SIZE);
+
+  gboolean written = TRUE;
+  written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_DB2_GET_OBJECT_LIST);
+  written &= fpi_byte_writer_put_uint32_le (&writer, obj_type);
+  written &= fpi_byte_writer_put_data (&writer, obj_id, DB2_ID_SIZE);
 
   FAIL_TASK_SSM_AND_RETURN_IF_NOT_WRITTEN (written);
   FAIL_TASK_SSM_AND_RETURN_ON_WRONG_SEND_SIZE (writer, send_size);
@@ -2518,9 +2588,9 @@ send_db2_get_object_info (FpiDeviceSynaTlsMoc *self,
   fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
 
   gboolean written = TRUE;
-  fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_DB2_GET_OBJECT_INFO);
-  fpi_byte_writer_put_uint32_le (&writer, obj_type);
-  fpi_byte_writer_put_data (&writer, obj_id, DB2_ID_SIZE);
+  written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_DB2_GET_OBJECT_INFO);
+  written &= fpi_byte_writer_put_uint32_le (&writer, obj_type);
+  written &= fpi_byte_writer_put_data (&writer, obj_id, DB2_ID_SIZE);
 
   FAIL_TASK_SSM_AND_RETURN_IF_NOT_WRITTEN (written);
   FAIL_TASK_SSM_AND_RETURN_ON_WRONG_SEND_SIZE (writer, send_size);
@@ -2566,7 +2636,6 @@ recv_db2_get_payload_data (FpDevice *device, guint8 *buffer_in, gsize length_in,
   GError *local_error = NULL;
   FpiByteReader reader;
   gboolean read_ok = TRUE;
-  gboolean tagval_ok = TRUE;
 
   guint32 payload_size = 0;
   g_autofree guint8 *payload_data = NULL;
@@ -2584,7 +2653,13 @@ recv_db2_get_payload_data (FpDevice *device, guint8 *buffer_in, gsize length_in,
       return;
     }
 
-  g_assert (fpi_byte_reader_get_remaining (&reader) == 0);
+  if (fpi_byte_reader_get_remaining (&reader) != 0)
+    {
+      fpi_ssm_mark_failed (
+          self->task_ssm,
+          set_and_report_error (FP_DEVICE_ERROR_PROTO, "True payload size does not match expected payload size"));
+      return;
+    }
 
   g_autoptr (TagVal) tagval = NULL;
   if (!tagval_new_from_bytes (&tagval, payload_data, payload_size, &local_error))
@@ -2596,21 +2671,33 @@ recv_db2_get_payload_data (FpDevice *device, guint8 *buffer_in, gsize length_in,
   guint8 *user_id, *finger_id, *template_id;
   gsize template_id_len, user_id_len, finger_id_len;
 
-  tagval_ok &= tagval_get (tagval, ENROLL_TAG_TEMPLATE_ID, &template_id,
-                           &template_id_len, &local_error);
-  tagval_ok &= tagval_get (tagval, ENROLL_TAG_USER_ID, &user_id, &user_id_len,
-                           &local_error);
-  tagval_ok &= tagval_get (tagval, ENROLL_TAG_FINGER_ID, &finger_id,
-                           &finger_id_len, &local_error);
-  if (!tagval_ok)
+  if ((!tagval_get (tagval, ENROLL_TAG_TEMPLATE_ID, &template_id,
+                    &template_id_len, &local_error)) ||
+      (!tagval_get (tagval, ENROLL_TAG_USER_ID, &user_id, &user_id_len,
+                    &local_error)) ||
+      (!tagval_get (tagval, ENROLL_TAG_FINGER_ID, &finger_id,
+                    &finger_id_len, &local_error)))
     {
       fpi_ssm_mark_failed (self->task_ssm, local_error);
       return;
     }
 
-  g_assert (template_id_len == sizeof (Db2Id));
-  g_assert (user_id_len == sizeof (FpUserId));
-  g_assert (finger_id_len == sizeof (FingerId));
+  if (template_id_len != sizeof (Db2Id) ||
+      user_id_len != sizeof (FpUserId) ||
+      finger_id_len != sizeof (FingerId))
+    {
+      fpi_ssm_mark_failed (
+          self->task_ssm,
+          set_and_report_error (
+              FP_DEVICE_ERROR_PROTO,
+              "Unexpected tagval lengths: template=%" G_GSIZE_FORMAT
+              " (expected %" G_GSIZE_FORMAT "), user=%" G_GSIZE_FORMAT
+              " (expected %" G_GSIZE_FORMAT "), finger=%" G_GSIZE_FORMAT
+              " (expected %" G_GSIZE_FORMAT ")",
+              template_id_len, sizeof (Db2Id),
+              user_id_len, sizeof (FpUserId),
+              finger_id_len, sizeof (FingerId)));
+    }
 
 #ifdef DEBUG
   g_autofree gchar *tuid_str =
@@ -2642,7 +2729,13 @@ send_db2_get_object_data (FpiDeviceSynaTlsMoc *self,
                           const Db2Id obj_id,
                           gsize obj_data_size)
 {
-  g_assert (obj_data_size < 65535);
+  if (obj_data_size >= 65535)
+    {
+      fpi_ssm_mark_failed (
+          self->task_ssm,
+          set_and_report_error (FP_DEVICE_ERROR_PROTO, "Received object data size too large: %" G_GSIZE_FORMAT, obj_data_size));
+      return;
+    }
 
   const guint send_size = 21;
   guint expected_recv_size;
@@ -2667,9 +2760,9 @@ send_db2_get_object_data (FpiDeviceSynaTlsMoc *self,
   fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
 
   gboolean written = TRUE;
-  fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_DB2_GET_OBJECT_DATA);
-  fpi_byte_writer_put_uint32_le (&writer, obj_type);
-  fpi_byte_writer_put_data (&writer, obj_id, DB2_ID_SIZE);
+  written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_DB2_GET_OBJECT_DATA);
+  written &= fpi_byte_writer_put_uint32_le (&writer, obj_type);
+  written &= fpi_byte_writer_put_data (&writer, obj_id, DB2_ID_SIZE);
 
   FAIL_TASK_SSM_AND_RETURN_IF_NOT_WRITTEN (written);
   FAIL_TASK_SSM_AND_RETURN_ON_WRONG_SEND_SIZE (writer, send_size);
@@ -2870,9 +2963,9 @@ send_db2_format (FpiDeviceSynaTlsMoc *self)
   const guint expected_recv_size = 8;
 
   FpiByteWriter writer;
-  gboolean written = TRUE;
-
   fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
+
+  gboolean written = TRUE;
   written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_DB2_FORMAT);
   written &= fpi_byte_writer_put_uint8 (&writer, 1);
   written &= fpi_byte_writer_fill (&writer, 0, 10);
@@ -3008,13 +3101,13 @@ send_bootloader_mode_enter_exit (FpiDeviceSynaTlsMoc *self,
 
   switch (type)
     {
-    case BOOTLOADER_MODE_EXIT:
+    case BOOTLOADER_MODE_ENTER:
 #ifdef DEBUG
       fp_dbg ("Entering bootloader mode");
 #endif
       to_send = to_send_enter;
       break;
-    case BOOTLOADER_MODE_ENTER:
+    case BOOTLOADER_MODE_EXIT:
 #ifdef DEBUG
       fp_dbg ("Exiting bootloader mode");
 #endif
@@ -3031,6 +3124,7 @@ send_bootloader_mode_enter_exit (FpiDeviceSynaTlsMoc *self,
 
 /* end of communication function =========================================== */
 
+#ifdef USE_SAMPLE_PAIRING_DATA
 static void
 synatlsmoc_load_sample_pairing_data (FpiDeviceSynaTlsMoc *self)
 {
@@ -3039,18 +3133,17 @@ synatlsmoc_load_sample_pairing_data (FpiDeviceSynaTlsMoc *self)
   guint8 *privkey_pem;
   gsize privkey_pem_len;
 
-  guint8 *client_cert_raw = sample_recv_host_cert;
-  gsize client_cert_len = CERTIFICATE_SIZE;
-
-  guint8 *server_cert_raw = sample_sensor_cert;
-  gsize server_cert_len = CERTIFICATE_SIZE;
+  G_STATIC_ASSERT (sizeof (sample_recv_host_cert) == CERTIFICATE_SIZE);
+  G_STATIC_ASSERT (sizeof (sample_sensor_cert) == CERTIFICATE_SIZE);
 
   privkey_pem = sample_privkey_pem;
   privkey_pem_len = sizeof (sample_privkey_pem);
 
 #ifdef DEBUG
-  g_autofree gchar *client_cert_str = bin2hex (client_cert_raw, client_cert_len);
-  g_autofree gchar *server_cert_str = bin2hex (server_cert_raw, server_cert_len);
+  g_autofree gchar *client_cert_str = bin2hex (sample_recv_host_cert,
+                                               CERTIFICATE_SIZE);
+  g_autofree gchar *server_cert_str = bin2hex (sample_sensor_cert,
+                                               CERTIFICATE_SIZE);
   fp_dbg ("Loading sample pairing data:");
   fp_dbg ("\thost cert: %s", client_cert_str);
   fp_dbg ("\tsensor cert: %s", server_cert_str);
@@ -3067,16 +3160,11 @@ synatlsmoc_load_sample_pairing_data (FpiDeviceSynaTlsMoc *self)
                               &privkey_pem_len) <= 0)
     g_assert_not_reached ();
 
-  self->pairing_data.client_cert_raw =
-      g_memdup2 (client_cert_raw, client_cert_len);
-  self->pairing_data.client_cert_len = client_cert_len;
-
-  self->pairing_data.server_cert_raw =
-      g_memdup2 (server_cert_raw, server_cert_len);
-  self->pairing_data.server_cert_len = server_cert_len;
+  memcpy (self->pairing_data.client_cert_raw, sample_recv_host_cert, CERTIFICATE_SIZE);
+  memcpy (self->pairing_data.server_cert_raw, sample_sensor_cert, CERTIFICATE_SIZE);
 
   if (!sensor_certificate_from_raw (&self->pairing_data.client_cert,
-                                    client_cert_raw, client_cert_len,
+                                    self->pairing_data.client_cert_raw,
                                     &local_error))
     {
       fpi_ssm_mark_failed (self->task_ssm, set_and_report_error (
@@ -3088,7 +3176,7 @@ synatlsmoc_load_sample_pairing_data (FpiDeviceSynaTlsMoc *self)
     }
 
   if (!sensor_certificate_from_raw (&self->pairing_data.server_cert,
-                                    server_cert_raw, server_cert_len,
+                                    self->pairing_data.server_cert_raw,
                                     &local_error))
     {
       fpi_ssm_mark_failed (
@@ -3100,6 +3188,7 @@ synatlsmoc_load_sample_pairing_data (FpiDeviceSynaTlsMoc *self)
       return;
     }
 }
+#endif
 
 static void
 synatlsmoc_event_interrupt_cb (FpiUsbTransfer *transfer,
@@ -3134,6 +3223,7 @@ synatlsmoc_event_interrupt_cb (FpiUsbTransfer *transfer,
       error =
           set_and_report_error (FP_DEVICE_ERROR_PROTO, "Interrupt data too short");
       fpi_ssm_mark_failed (transfer->ssm, error);
+      return;
     }
 
 #ifdef DEBUG
@@ -3213,18 +3303,6 @@ export_private_key_to_pem (EVP_PKEY *pkey, GError **error)
 static void
 store_pairing_data (FpiDeviceSynaTlsMoc *self)
 {
-  // FIXME: raw cert lengths from pairing data and check on loading
-
-  g_autofree guint8 *client_cert_raw_cpy =
-      g_memdup2 (self->pairing_data.client_cert_raw, CERTIFICATE_SIZE);
-  GVariant *client_cert_var = g_variant_new_fixed_array (
-      G_VARIANT_TYPE_BYTE, client_cert_raw_cpy, CERTIFICATE_SIZE, 1);
-
-  g_autofree guint8 *server_cert_raw_cpy =
-      g_memdup2 (self->pairing_data.server_cert_raw, CERTIFICATE_SIZE);
-  GVariant *server_cert_var = g_variant_new_fixed_array (
-      G_VARIANT_TYPE_BYTE, server_cert_raw_cpy, CERTIFICATE_SIZE, 1);
-
   GError *local_error = NULL;
   g_autofree char *privkey_pem =
       export_private_key_to_pem (self->pairing_data.client_key, &local_error);
@@ -3233,6 +3311,11 @@ store_pairing_data (FpiDeviceSynaTlsMoc *self)
       fpi_ssm_mark_failed (self->task_ssm, local_error);
       return;
     }
+
+  GVariant *client_cert_var = g_variant_new_fixed_array (
+      G_VARIANT_TYPE_BYTE, self->pairing_data.client_cert_raw, CERTIFICATE_SIZE, 1);
+  GVariant *server_cert_var = g_variant_new_fixed_array (
+      G_VARIANT_TYPE_BYTE, self->pairing_data.server_cert_raw, CERTIFICATE_SIZE, 1);
 
   GVariant *privkey_pem_var = g_variant_new_string (privkey_pem);
 
@@ -3243,9 +3326,9 @@ store_pairing_data (FpiDeviceSynaTlsMoc *self)
 
 #ifdef DEBUG
   g_autofree char *client_cert_str =
-      bin2hex (client_cert_raw_cpy, CERTIFICATE_SIZE);
+      bin2hex (self->pairing_data.client_cert_raw, CERTIFICATE_SIZE);
   g_autofree char *server_cert_str =
-      bin2hex (server_cert_raw_cpy, CERTIFICATE_SIZE);
+      bin2hex (self->pairing_data.server_cert_raw, CERTIFICATE_SIZE);
 
   fp_dbg ("Successfully stored pairing data:");
   fp_dbg ("\tClient certificate: %s", client_cert_str);
@@ -3256,7 +3339,7 @@ store_pairing_data (FpiDeviceSynaTlsMoc *self)
   fpi_ssm_next_state (self->task_ssm);
 }
 
-static void
+static gboolean
 load_pairing_data (FpiDeviceSynaTlsMoc *self)
 {
   GError *local_error = NULL;
@@ -3270,6 +3353,8 @@ load_pairing_data (FpiDeviceSynaTlsMoc *self)
   g_autoptr (GVariant) server_cert_var = NULL;
   g_autoptr (GVariant) privkey_pem_var = NULL;
 
+  free_pairing_data (&self->pairing_data);
+
   g_object_get (FP_DEVICE (self), "fpi-persistent-data", &pairing_data, NULL);
 
   if (pairing_data == NULL)
@@ -3278,7 +3363,7 @@ load_pairing_data (FpiDeviceSynaTlsMoc *self)
           self->task_ssm,
           set_and_report_error (FP_DEVICE_ERROR_GENERAL,
                                 "Received NULL as stored pairing data"));
-      return;
+      return FALSE;
     }
 
   if (!g_variant_check_format_string (pairing_data, "(@ay@ay@s)", FALSE))
@@ -3287,7 +3372,7 @@ load_pairing_data (FpiDeviceSynaTlsMoc *self)
           self->task_ssm,
           set_and_report_error (FP_DEVICE_ERROR_GENERAL,
                                 "Stored pairing data have incorrect format"));
-      return;
+      return FALSE;
     }
 
   g_variant_get (pairing_data, "(@ay@ay@s)", &client_cert_var, &server_cert_var,
@@ -3304,11 +3389,9 @@ load_pairing_data (FpiDeviceSynaTlsMoc *self)
               FP_DEVICE_ERROR_GENERAL,
               "Stored sensor/client certificate has invalid size: %lu",
               client_cert_data_size));
-      return;
+      return FALSE;
     }
-  self->pairing_data.client_cert_raw =
-      g_memdup2 (client_cert_data, CERTIFICATE_SIZE);
-  self->pairing_data.client_cert_len = CERTIFICATE_SIZE;
+  memcpy (self->pairing_data.client_cert_raw, client_cert_data, CERTIFICATE_SIZE);
 
 #ifdef DEBUG
   g_autofree char *client_cert_str =
@@ -3327,11 +3410,9 @@ load_pairing_data (FpiDeviceSynaTlsMoc *self)
               FP_DEVICE_ERROR_GENERAL,
               "Stored host/server certificate has invalid size: %lu",
               server_cert_data_size));
-      return;
+      return FALSE;
     }
-  self->pairing_data.server_cert_raw =
-      g_memdup2 (server_cert_data, CERTIFICATE_SIZE);
-  self->pairing_data.server_cert_len = CERTIFICATE_SIZE;
+  memcpy (self->pairing_data.server_cert_raw, server_cert_data, CERTIFICATE_SIZE);
 
 #ifdef DEBUG
   g_autofree char *server_cert_str =
@@ -3340,7 +3421,6 @@ load_pairing_data (FpiDeviceSynaTlsMoc *self)
 #endif
 
   gsize privkey_pem_size = 0;
-  // fIXME: autofree
   const gchar *privkey_pem =
       g_variant_get_string (privkey_pem_var, &privkey_pem_size);
 
@@ -3356,23 +3436,29 @@ load_pairing_data (FpiDeviceSynaTlsMoc *self)
   if (dctx == NULL ||
       OSSL_DECODER_from_data (dctx, (const guint8 **) &privkey_pem,
                               &privkey_pem_size) <= 0)
-    g_assert_not_reached ();
+    {
+      fpi_ssm_mark_failed (self->task_ssm, set_and_report_error (
+                                               FP_DEVICE_ERROR_DATA_INVALID,
+                                               "Cannot decode stored private key: %s",
+                                               ERR_error_string (ERR_get_error (), NULL)));
+      return FALSE;
+    }
 
   if (!sensor_certificate_from_raw (
           &self->pairing_data.client_cert, self->pairing_data.client_cert_raw,
-          self->pairing_data.client_cert_len, &local_error))
+          &local_error))
     {
       fpi_ssm_mark_failed (self->task_ssm, set_and_report_error (
                                                FP_DEVICE_ERROR_PROTO,
                                                "Cannot parse host certificate: %s",
                                                local_error->message));
       g_error_free (local_error);
-      return;
+      return FALSE;
     }
 
   if (!sensor_certificate_from_raw (
           &self->pairing_data.server_cert, self->pairing_data.server_cert_raw,
-          self->pairing_data.server_cert_len, &local_error))
+          &local_error))
     {
       fpi_ssm_mark_failed (
           self->task_ssm,
@@ -3380,32 +3466,19 @@ load_pairing_data (FpiDeviceSynaTlsMoc *self)
                                 "Cannot parse sensor certificate: %s",
                                 local_error->message));
       g_error_free (local_error);
-      return;
+      return FALSE;
     }
+  return TRUE;
 }
 
 static void
 pair (FpiDeviceSynaTlsMoc *self)
 {
-  if (!synatlsmoc_is_provisioned (self))
-    {
-      fp_warn ("Skipping pairing: sensor is already paired or insecure");
-      return;
-    }
-
-  if (!synatlsmoc_has_advanced_security (self))
-    {
-      fp_warn (
-          "Skipping pairing: only advanced security is supported (per "
-          "Windows driver)");
-      fpi_ssm_next_state (self->task_ssm);
-      return;
-    }
-
 #ifdef DEBUG
   fp_dbg ("Pairing sensor");
 #endif
 
+  g_clear_pointer (&self->pairing_data.client_key, EVP_PKEY_free);
   self->pairing_data.client_key = EVP_EC_gen ("prime256v1");
 
   /* we create it already serialized, as we do not need it in struct form */
@@ -3438,18 +3511,17 @@ fetch_pairing_data (FpiDeviceSynaTlsMoc *self)
   if ((!synatlsmoc_is_provisioned (self)) || pairing_data == NULL)
     {
       if (pairing_data == NULL)
-        fp_warn ("Pairing data in persistent storage are NULL");
+        fp_info ("Pairing data in persistent storage are NULL");
       if (!synatlsmoc_is_provisioned (self))
-        fp_warn ("Sensor is not provisioned");
+        fp_info ("Sensor is not provisioned");
 
-      fp_warn ("Need to pair sensor");
+      fp_info ("Need to pair sensor");
       fpi_ssm_next_state (self->task_ssm); /* OPEN_SEND_PAIR */
     }
   else
     {
-      load_pairing_data (self);
-      /* skip over pairing states */
-      fpi_ssm_jump_to_state (self->task_ssm, OPEN_VERIFY_SENSOR_CERTIFICATE);
+      if (load_pairing_data (self)) /* skip over pairing states */
+        fpi_ssm_jump_to_state (self->task_ssm, OPEN_VERIFY_SENSOR_CERTIFICATE);
     }
 #endif
 }
@@ -3522,6 +3594,7 @@ synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *dev)
                                             FP_DEVICE_ERROR_NOT_SUPPORTED,
                                             "Sensor doesn't have a valid firmware, "
                                             "need to update to a valid one first!"));
+              return;
             }
           else
             {
@@ -3538,19 +3611,17 @@ synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *dev)
       synatlsmoc_load_sensor_key (self);
       break;
     case OPEN_LOAD_PAIRING_DATA:
-      if (synatlsmoc_is_provisioned (self) ||
-          synatlsmoc_has_advanced_security (self))
-        {
-          fetch_pairing_data (self);
-        }
+
+      if (!synatlsmoc_has_advanced_security (self))
+        fpi_ssm_mark_failed (ssm, set_and_report_error (
+                                      FP_DEVICE_ERROR_NOT_SUPPORTED,
+                                      "This sensor does not support advanced security - either modify this driver to disable TLS or use the non-TLS driver"));
+      else if (!synatlsmoc_is_provisioned (self))
+        fpi_ssm_mark_failed (ssm, set_and_report_error (
+                                      FP_DEVICE_ERROR_NOT_SUPPORTED,
+                                      "This sensor is not provisioned - either do not use TLS or provision it via Windows driver (provisioning not implemented here)"));
       else
-        {
-          fpi_ssm_mark_failed (
-              ssm, set_and_report_error (
-                       FP_DEVICE_ERROR_NOT_SUPPORTED,
-                       "Sensor is unprovisioned or does not support advanced "
-                       "security, cannot establishing TLS session"));
-        }
+        fetch_pairing_data (self);
       break;
     case OPEN_SEND_PAIR:
       {
@@ -3567,13 +3638,10 @@ synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
     case OPEN_TLS_ESTABLISH:
       {
-        self->session = tls_session_new ();
-
-        if (!tls_session_init (self->session, &self->pairing_data, &error))
-          {
-            fpi_ssm_mark_failed (ssm, error);
-            break;
-          }
+        self->session = tls_session_new (self->pairing_data.client_cert_raw,
+                                         CERTIFICATE_SIZE,
+                                         self->pairing_data.client_key,
+                                         self->pairing_data.server_cert.pub_key);
 
         if (!tls_session_establish (self->session, &error))
           {
@@ -3608,6 +3676,13 @@ synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *dev)
 }
 
 static void
+open_data_free (OpenData *data)
+{
+  EVP_PKEY_free (data->pub_key);
+  g_free (data);
+}
+
+static void
 synatlsmoc_open (FpDevice *device)
 {
   FP_DBG_HIGHLIGHTED ("Open");
@@ -3632,7 +3707,7 @@ synatlsmoc_open (FpDevice *device)
   self->task_ssm = fpi_ssm_new_full (device, synatlsmoc_open_run_state,
                                      OPEN_NUM_STATES, OPEN_NUM_STATES, "Open");
   OpenData *open_ssm_data = g_new0 (OpenData, 1);
-  fpi_ssm_set_data (self->task_ssm, open_ssm_data, (GDestroyNotify) g_free);
+  fpi_ssm_set_data (self->task_ssm, open_ssm_data, (GDestroyNotify) open_data_free);
   fpi_ssm_start (self->task_ssm, synatlsmoc_open_done);
   return;
 }
@@ -3702,9 +3777,8 @@ close_tls_session (FpiDeviceSynaTlsMoc *self)
       return;
     }
 
-  // FIXME: callback was made for open only (why was this here if it works?)
   synatlsmoc_exec_cmd (self, TRUE, FALSE, tls_data, tls_size, expected_recv_size,
-                       recv_tls_data);
+                       recv_tls_close_data);
 }
 
 static void
@@ -3748,6 +3822,12 @@ static void
 list_data_free (ListData *data)
 {
   g_clear_pointer (&data->list_result, g_ptr_array_unref);
+  g_clear_pointer (&data->list_template_id, g_ptr_array_unref);
+  g_clear_pointer (&data->list_payload_id, g_ptr_array_unref);
+
+  g_clear_pointer (&data->current_template_id, g_free);
+  g_clear_pointer (&data->current_payload_id, g_free);
+
   g_free (data);
 }
 
@@ -3819,16 +3899,6 @@ synatlsmoc_list_run_state (FpiSsm *ssm, FpDevice *device)
       }
     case LIST_REPORT:
       {
-        g_ptr_array_free (data->list_template_id, TRUE);
-
-        if (data->list_payload_id)
-          g_ptr_array_free (data->list_payload_id, TRUE);
-
-        if (data->current_template_id)
-          g_free (data->current_template_id);
-        if (data->current_payload_id)
-          g_free (data->current_payload_id);
-
         fpi_device_list_complete (device, g_steal_pointer (&data->list_result),
                                   NULL);
         fpi_ssm_next_state (ssm);
@@ -3885,7 +3955,7 @@ get_template_id_from_fp_print (FpPrint *print, Db2Id template_id, GError **error
     }
 
   FingerId finger_id = 0;
-  g_variant_get (fpi_data, "(y@ay@ay)", finger_id, &tid_var, &fp_user_id_var);
+  g_variant_get (fpi_data, "(y@ay@ay)", &finger_id, &tid_var, &fp_user_id_var);
 
   gsize tid_len = 0;
   tid = g_variant_get_fixed_array (tid_var, &tid_len, 1);
@@ -3995,6 +4065,18 @@ synatlsmoc_enroll_run_state (FpiSsm *ssm, FpDevice *device)
         send_enroll_start (self);
         break;
       }
+    case ENROLL_SET_EVENT_FINGER_PRESENCE:
+      send_event_config (self, EV_FINGER_DOWN | EV_FINGER_UP);
+      break;
+    case ENROLL_WAIT_FINGER_PRESENCE:
+      synatlsmoc_wait_for_events (self);
+      break;
+    case ENROLL_CHECK_FINGER_PRESENCE:
+      if (self->first_event == EV_FINGER_DOWN)
+        fpi_ssm_next_state (ssm);
+      else
+        fpi_ssm_jump_to_state (ssm, ENROLL_SET_EVENT_FRAME_READY);
+      break;
     case ENROLL_SET_EVENT_FINGER_UP:
       send_event_config (self, EV_FINGER_UP);
       break;
@@ -4005,13 +4087,9 @@ synatlsmoc_enroll_run_state (FpiSsm *ssm, FpDevice *device)
       send_event_config (self, EV_FRAME_READY);
       break;
     case ENROLL_SEND_FRAME_ACQUIRE:
-      data->frame_acquire_retry_idx = FRAME_ACQUIRE_NUM_RETRIES;
-      send_frame_acquire (self, CAPTURE_FLAG_ENROLL);
+      send_frame_acquire (self, FRAME_ACQ_FLAGS_ENROLL);
       break;
-    case ENROLL_SET_EVENT_FINGER_DOWN:
-      send_event_config (self, EV_FINGER_DOWN | EV_FRAME_READY);
-      break;
-    case ENROLL_WAIT_FINGER_DOWN:
+    case ENROLL_WAIT_FRAME_READY:
       fpi_device_report_finger_status (device, FP_FINGER_STATUS_NEEDED);
       synatlsmoc_wait_for_events (self);
       break;
@@ -4058,6 +4136,7 @@ synatlsmoc_enroll (FpDevice *device)
   g_strlcpy (data->fp_user_id, fp_user_id, sizeof (FpUserId));
 
   data->finger_id = fp_print_get_finger (data->print);
+  data->frame_acquire_retry_idx = FRAME_ACQUIRE_NUM_RETRIES;
 
   g_assert (self->task_ssm == NULL);
   self->task_ssm =
@@ -4073,6 +4152,18 @@ synatlsmoc_identify_verify_run_state (FpiSsm *ssm, FpDevice *device)
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
+    case IDENTIFY_VERIFY_SET_EVENT_FINGER_PRESENCE:
+      send_event_config (self, EV_FINGER_DOWN | EV_FINGER_UP);
+      break;
+    case IDENTIFY_VERIFY_WAIT_FINGER_PRESENCE:
+      synatlsmoc_wait_for_events (self);
+      break;
+    case IDENTIFY_VERIFY_CHECK_FINGER_PRESENCE:
+      if (self->first_event == EV_FINGER_DOWN)
+        fpi_ssm_next_state (ssm);
+      else
+        fpi_ssm_jump_to_state (ssm, IDENTIFY_VERIFY_SET_EVENT_FRAME_READY);
+      break;
     case IDENTIFY_VERIFY_SET_EVENT_FINGER_UP:
       send_event_config (self, EV_FINGER_UP);
       break;
@@ -4086,14 +4177,9 @@ synatlsmoc_identify_verify_run_state (FpiSsm *ssm, FpDevice *device)
       send_event_config (self, EV_FRAME_READY);
       break;
     case IDENTIFY_VERIFY_SEND_FRAME_ACQUIRE:;
-      IdentifyVerifyData *ssm_data = fpi_ssm_get_data (ssm);
-      ssm_data->frame_acquire_retry_idx = FRAME_ACQUIRE_NUM_RETRIES;
-      send_frame_acquire (self, CAPTURE_FLAG_AUTH);
+      send_frame_acquire (self, FRAME_ACQ_FLAGS_MATCH);
       break;
-    case IDENTIFY_VERIFY_SET_EVENT_FINGER_DOWN:
-      send_event_config (self, EV_FINGER_DOWN | EV_FRAME_READY);
-      break;
-    case IDENTIFY_VERIFY_WAIT_FINGER_DOWN:
+    case IDENTIFY_VERIFY_WAIT_FRAME_READY:
       fpi_device_report_finger_status (device, FP_FINGER_STATUS_NEEDED);
       synatlsmoc_wait_for_events (self);
       break;
@@ -4151,6 +4237,7 @@ synatlsmoc_identify_verify (FpDevice *device)
   g_assert (self->task_ssm == NULL);
 
   IdentifyVerifyData *ssm_data = g_new0 (IdentifyVerifyData, 1);
+  ssm_data->frame_acquire_retry_idx = FRAME_ACQUIRE_NUM_RETRIES;
   self->task_ssm = fpi_ssm_new_full (
       device, synatlsmoc_identify_verify_run_state, IDENTIFY_VERIFY_NUM_STATES,
       IDENTIFY_VERIFY_NUM_STATES, "Identify/Verify");
@@ -4168,7 +4255,7 @@ synatlsmoc_clear_storage_run_state (FpiSsm *ssm, FpDevice *device)
     case CLEAR_STORAGE_DB2_FORMAT:
       send_db2_format (self);
       break;
-    case IDENTIFY_VERIFY_COMPLETE:
+    case CLEAR_STORAGE_COMPLETE:
       fpi_device_clear_storage_complete (device, NULL);
       fpi_ssm_next_state (ssm);
       break;
