@@ -337,6 +337,13 @@ typedef enum
 
 typedef enum
 {
+  CAPTURE_FINISH_EVENT_MASK_NONE = 0,
+  CAPTURE_FINISH_FRAME_FINISH,
+  CAPTURE_FINISH_NUM_STATES,
+} CaptureFinishState;
+
+typedef enum
+{
   BOOTLOADER_MODE_EXIT = 0,
   BOOTLOADER_MODE_ENTER,
 } BootloaderModeEnterExit;

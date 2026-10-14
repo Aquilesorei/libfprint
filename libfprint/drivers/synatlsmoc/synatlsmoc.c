@@ -81,7 +81,6 @@ struct _FpiDeviceSynaTlsMoc
   FpiSsm *task_ssm;
   FpiSsm *cmd_ssm;
   FpiUsbTransfer *cmd_transfer;
-  GCancellable *interrupt_cancellable;
 
   guint8 fw_version_major;
   guint8 fw_version_minor;
@@ -103,6 +102,8 @@ struct _FpiDeviceSynaTlsMoc
   guint32 first_event;
   guint num_pending_events;
   gboolean event_read_in_legacy_mode;
+
+  gboolean capture_started;
 
   /* quirks */
   gboolean disable_image_metrics;
@@ -559,8 +560,8 @@ synatlsmoc_cmd_run_state (FpiSsm *ssm, FpDevice *device)
       fpi_usb_transfer_fill_bulk (transfer, SYNATLSMOC_EP_RESP_IN,
                                   data->length_in);
       fpi_usb_transfer_submit (
-          g_steal_pointer (&transfer), SYNATLSMOC_USB_RECV_TIMEOUT,
-          fpi_device_get_cancellable (device), synatlsmoc_cmd_receive_cb, data);
+          g_steal_pointer (&transfer), SYNATLSMOC_USB_RECV_TIMEOUT, NULL,
+          synatlsmoc_cmd_receive_cb, data);
       break;
     }
 }
@@ -968,6 +969,7 @@ recv_frame_acquire (FpDevice *device, guint8 *buffer_in, gsize length_in, GError
   guint16 status = FP_READ_UINT16_LE (buffer_in);
   if (status_is_success (status))
     {
+      self->capture_started = TRUE;
       fpi_ssm_next_state (self->task_ssm);
     }
   else if (status == RESPONSE_PROCESSING_FRAME)
@@ -1062,6 +1064,8 @@ sensor_frame_finish (FpiDeviceSynaTlsMoc *self)
 #ifdef DEBUG
   fp_dbg ("Frame finish command");
 #endif
+
+  self->capture_started = FALSE;
 
   guint8 cmd[send_size];
   cmd[0] = VCSFW_CMD_FRAME_FINISH;
@@ -3231,7 +3235,7 @@ synatlsmoc_wait_for_events (FpiDeviceSynaTlsMoc *self)
 
   fpi_usb_transfer_fill_interrupt (transfer, SYNATLSMOC_EP_INTERRUPT, 7);
   fpi_usb_transfer_submit (transfer, SYNATLSMOC_USB_INTERRUPT_TIMEOUT,
-                           self->interrupt_cancellable,
+                           fpi_device_get_cancellable (FP_DEVICE (self)),
                            synatlsmoc_event_interrupt_cb, NULL);
 }
 
@@ -3515,6 +3519,7 @@ synatlsmoc_drop_session (FpiDeviceSynaTlsMoc *self)
 {
   g_clear_pointer (&self->session, tls_session_free);
   self->session_out_of_sync = FALSE;
+  self->capture_started = FALSE;
 }
 
 static void
@@ -3683,8 +3688,6 @@ synatlsmoc_open (FpDevice *device)
   FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
   GError *error = NULL;
 
-  self->interrupt_cancellable = g_cancellable_new ();
-
   if (self->session == NULL && !g_usb_device_reset (
                                    fpi_device_get_usb_device (device), &error))
     {
@@ -3705,17 +3708,6 @@ synatlsmoc_open (FpDevice *device)
   fpi_ssm_set_data (self->task_ssm, open_ssm_data, (GDestroyNotify) open_data_free);
   fpi_ssm_start (self->task_ssm, synatlsmoc_open_done);
   return;
-}
-
-static void
-synatlsmoc_cancel (FpDevice *device)
-{
-  FP_DBG_HIGHLIGHTED ("Cancel");
-  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
-
-  g_cancellable_cancel (self->interrupt_cancellable);
-  g_clear_object (&self->interrupt_cancellable);
-  self->interrupt_cancellable = g_cancellable_new ();
 }
 
 static void
@@ -3757,9 +3749,6 @@ synatlsmoc_close (FpDevice *device)
 {
   FP_DBG_HIGHLIGHTED ("Close");
   FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
-
-  g_cancellable_cancel (self->interrupt_cancellable);
-  g_clear_object (&self->interrupt_cancellable);
 
   self->task_ssm =
       fpi_ssm_new_full (device, synatlsmoc_close_ssm_run_state, CLOSE_NUM_STATES,
@@ -3996,6 +3985,55 @@ sensor_add_enrollment (FpiDeviceSynaTlsMoc *self, Db2Id template_id, FpUserId fp
 }
 
 static void
+synatlsmoc_capture_finish_run_state (FpiSsm *ssm, FpDevice *device)
+{
+  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case CAPTURE_FINISH_EVENT_MASK_NONE:
+      send_event_config (self, NO_EVENTS);
+      break;
+    case CAPTURE_FINISH_FRAME_FINISH:
+      sensor_frame_finish (self);
+      break;
+    }
+}
+
+static void
+synatlsmoc_capture_finish_done (FpiSsm *ssm, FpDevice *device, GError *error)
+{
+  GError *capture_error = fpi_ssm_get_data (ssm);
+
+  if (error)
+    {
+      fp_warn ("Failed to finish the capture: %s", error->message);
+      g_error_free (error);
+    }
+
+  synatlsmoc_task_ssm_done (ssm, device, capture_error);
+}
+
+static void
+synatlsmoc_capture_task_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
+{
+  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
+
+  if (error && self->capture_started && !self->session_out_of_sync)
+    {
+      self->task_ssm = fpi_ssm_new_full (device, synatlsmoc_capture_finish_run_state,
+                                         CAPTURE_FINISH_NUM_STATES,
+                                         CAPTURE_FINISH_NUM_STATES,
+                                         "Capture finish");
+      fpi_ssm_set_data (self->task_ssm, error, NULL);
+      fpi_ssm_start (self->task_ssm, synatlsmoc_capture_finish_done);
+      return;
+    }
+
+  synatlsmoc_task_ssm_done (ssm, device, error);
+}
+
+static void
 synatlsmoc_enroll_run_state (FpiSsm *ssm, FpDevice *device)
 {
   FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
@@ -4092,7 +4130,7 @@ synatlsmoc_enroll (FpDevice *device)
       fpi_ssm_new_full (device, synatlsmoc_enroll_run_state, ENROLL_NUM_STATES,
                         ENROLL_NUM_STATES, "Enroll");
   fpi_ssm_set_data (self->task_ssm, data, g_free);
-  fpi_ssm_start (self->task_ssm, synatlsmoc_task_ssm_done);
+  fpi_ssm_start (self->task_ssm, synatlsmoc_capture_task_ssm_done);
 }
 static void
 synatlsmoc_identify_verify_run_state (FpiSsm *ssm, FpDevice *device)
@@ -4191,7 +4229,7 @@ synatlsmoc_identify_verify (FpDevice *device)
       device, synatlsmoc_identify_verify_run_state, IDENTIFY_VERIFY_NUM_STATES,
       IDENTIFY_VERIFY_NUM_STATES, "Identify/Verify");
   fpi_ssm_set_data (self->task_ssm, ssm_data, g_free);
-  fpi_ssm_start (self->task_ssm, synatlsmoc_task_ssm_done);
+  fpi_ssm_start (self->task_ssm, synatlsmoc_capture_task_ssm_done);
 }
 
 static void
@@ -4265,7 +4303,6 @@ fpi_device_synatlsmoc_class_init (FpiDeviceSynaTlsMocClass *klass)
   dev_class->list = synatlsmoc_list;
   dev_class->delete = synatlsmoc_delete;
   dev_class->clear_storage = synatlsmoc_clear_storage;
-  dev_class->cancel = synatlsmoc_cancel;
 
   fpi_device_class_auto_initialize_features (dev_class);
 }
