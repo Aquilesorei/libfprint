@@ -107,17 +107,24 @@ struct _FpiDeviceSynaTlsMoc
 
   /* quirks */
   gboolean disable_image_metrics;
+  gboolean has_leds;
+  guint led_event;
+  guint led_retries;
+  guint led_next_state;
+  guint led_result_event;
 };
 
 G_DEFINE_TYPE (FpiDeviceSynaTlsMoc, fpi_device_synatlsmoc, FP_TYPE_DEVICE);
 
 // clang-format off
 static const FpIdEntry id_table[] = {
-    { .vid = KENSINGTON_VENDOR_ID, .pid = 0x8054, },
+    { .vid = KENSINGTON_VENDOR_ID, .pid = 0x8054,
+      .driver_data = SYNATLSMOC_DRIVER_DATA_HAS_LED, },
     /* the sensors commented out are untested, but should be suported */
     { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00C9, },
     { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00D1, },
-    { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00D6, },
+    { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00D6,
+      .driver_data = SYNATLSMOC_DRIVER_DATA_HAS_LED, },
     { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00D8, },
     { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00E7, },
     { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00E9, },
@@ -445,6 +452,188 @@ sensor_status_is_result_bad_param (guint16 status)
   return (status == VCS_RESULT_GEN_BAD_PARAM_1 ||
           status == VCS_RESULT_GEN_BAD_PARAM_2 ||
           status == VCS_RESULT_GEN_BAD_PARAM_3);
+}
+
+static void synatlsmoc_exec_cmd (FpiDeviceSynaTlsMoc *self, gboolean raw,
+                                 gboolean check_res, guint8 *cmd,
+                                 gsize cmd_size, gsize resp_size,
+                                 CmdCallback callback);
+
+/* VCSFW_CMD_LED_EX2 ====================================================== */
+
+enum
+{
+  LED_EVENT_IDLE = 0,
+  LED_EVENT_WAITING_FOR_FINGER,
+  LED_EVENT_ENROLL_RETRY,
+  LED_EVENT_ENROLL_PROGRESS,
+  LED_EVENT_MATCH_SUCCESS,
+  LED_EVENT_MATCH_FAILURE,
+};
+
+typedef struct
+{
+  guint16 field0;
+  guint32 parameter[3];
+} LedAction;
+
+typedef struct
+{
+  guint32 duration_ms;
+  LedAction action[6];
+} LedProfile;
+
+#define LED_ACTION(field, p0, p1, p2) \
+  { (field), { (p0), (p1), (p2) } }
+
+#define LED_IDLE_ACTION LED_ACTION (0x0000, 0x20000000, 0x00000000, 0x00000000)
+#define LED_ZERO_ACTION LED_ACTION (0x0000, 0x00000000, 0x00000000, 0x00000000)
+
+static const LedProfile led_profiles[] = {
+  [LED_EVENT_IDLE] = {
+    0,
+    { LED_IDLE_ACTION, LED_IDLE_ACTION, LED_IDLE_ACTION,
+      LED_IDLE_ACTION, LED_IDLE_ACTION, LED_IDLE_ACTION },
+  },
+  [LED_EVENT_WAITING_FOR_FINGER] = {
+    160000,
+    {
+      LED_ACTION (0xffff, 0x20000505, 0x00000000, 0x00000505),
+      LED_ACTION (0xffff, 0x20000505, 0x00000000, 0x00000505),
+      LED_ACTION (0xffff, 0x20000505, 0x00000000, 0x00000505),
+      LED_ZERO_ACTION, LED_ZERO_ACTION, LED_ZERO_ACTION,
+    },
+  },
+  [LED_EVENT_ENROLL_RETRY] = {
+    500,
+    {
+      LED_ACTION (0x01f4, 0x20000507, 0x00000000, 0x00000505),
+      LED_IDLE_ACTION,
+      LED_ACTION (0x01f4, 0x20000500, 0x00000000, 0x00000000),
+      LED_IDLE_ACTION, LED_ZERO_ACTION, LED_ZERO_ACTION,
+    },
+  },
+  [LED_EVENT_ENROLL_PROGRESS] = {
+    1000,
+    {
+      LED_ACTION (0x01f4, 0x20000107, 0x00000101, 0x00000000),
+      LED_IDLE_ACTION,
+      LED_ACTION (0x01f4, 0x20000100, 0x00000000, 0x00000000),
+      LED_IDLE_ACTION, LED_ZERO_ACTION, LED_ZERO_ACTION,
+    },
+  },
+  [LED_EVENT_MATCH_SUCCESS] = {
+    500,
+    {
+      LED_ACTION (0x01f4, 0x20000507, 0x00000000, 0x00000505),
+      LED_IDLE_ACTION,
+      LED_ACTION (0x01f4, 0x20000500, 0x00000000, 0x00000000),
+      LED_IDLE_ACTION, LED_ZERO_ACTION, LED_ZERO_ACTION,
+    },
+  },
+  [LED_EVENT_MATCH_FAILURE] = {
+    1000,
+    {
+      LED_ACTION (0x004b, 0x20000107, 0x00000101, 0x00000000),
+      LED_ACTION (0x004b, 0x20000001, 0x00000000, 0x00000000),
+      LED_ACTION (0x004b, 0x20000101, 0x00000000, 0x00000000),
+      LED_ACTION (0x004b, 0x20000001, 0x00000000, 0x00000000),
+      LED_ZERO_ACTION, LED_ZERO_ACTION,
+    },
+  },
+};
+
+static void recv_led_event (FpDevice *device, guint8 *buffer_in,
+                            gsize length_in, GError *error);
+
+static void
+send_led_event_command (FpiDeviceSynaTlsMoc *self)
+{
+  const LedProfile *profile = &led_profiles[self->led_event];
+  const guint send_size = 1 + sizeof (guint32) + (6 * 0x14);
+  const guint expected_recv_size = SENSOR_FW_REPLY_STATUS_HEADER_LEN;
+  FpiByteWriter writer;
+  gboolean written = TRUE;
+
+  fpi_byte_writer_init_with_size (&writer, send_size, TRUE);
+  written &= fpi_byte_writer_put_uint8 (&writer, VCSFW_CMD_LED_EX2);
+  written &= fpi_byte_writer_put_uint32_le (&writer, profile->duration_ms);
+
+  for (guint i = 0; i < G_N_ELEMENTS (profile->action); i++)
+    {
+      const LedAction *action = &profile->action[i];
+
+      written &= fpi_byte_writer_put_uint16_le (&writer, action->field0);
+      written &= fpi_byte_writer_put_uint16_le (&writer, 0);
+      written &= fpi_byte_writer_put_uint32_le (&writer, action->parameter[0]);
+      written &= fpi_byte_writer_put_uint32_le (&writer, action->parameter[1]);
+      written &= fpi_byte_writer_put_uint32_le (&writer, action->parameter[2]);
+      written &= fpi_byte_writer_put_uint32_le (&writer, 0);
+    }
+
+  FAIL_TASK_SSM_AND_RETURN_IF_NOT_WRITTEN (written);
+  FAIL_TASK_SSM_AND_RETURN_ON_WRONG_SEND_SIZE (writer, send_size);
+
+  g_autofree guint8 *cmd = fpi_byte_writer_reset_and_get_data (&writer);
+  /* 0xd1 is VCS_RESULT_SENSOR_BAD_CMD in the Windows implementation. */
+  synatlsmoc_exec_cmd (self, FALSE, FALSE, cmd, send_size,
+                       expected_recv_size, recv_led_event);
+}
+
+static void
+send_led_event (FpiDeviceSynaTlsMoc *self, guint event, guint next_state)
+{
+  self->led_event = event;
+  self->led_retries = 0;
+  self->led_next_state = next_state;
+
+  if (!self->has_leds || self->session_out_of_sync)
+    {
+      fpi_ssm_jump_to_state (self->task_ssm, next_state);
+      return;
+    }
+
+  send_led_event_command (self);
+}
+
+static void
+recv_led_event (FpDevice *device, guint8 *buffer_in, gsize length_in,
+                GError *error)
+{
+  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (self->task_ssm, error);
+      return;
+    }
+
+  if (length_in < SENSOR_FW_REPLY_STATUS_HEADER_LEN)
+    {
+      fpi_ssm_mark_failed (self->task_ssm,
+                           set_and_report_error (FP_DEVICE_ERROR_PROTO,
+                                                 "Invalid LED_EX2 response"));
+      return;
+    }
+
+  guint16 status = FP_READ_UINT16_LE (buffer_in);
+  if (status == VCS_RESULT_SENSOR_BAD_CMD && self->led_retries++ == 0)
+    {
+      send_led_event_command (self);
+      return;
+    }
+
+  if (!status_is_success (status))
+    {
+      fpi_ssm_mark_failed (
+          self->task_ssm,
+          set_and_report_error (FP_DEVICE_ERROR_PROTO,
+                                "LED_EX2 failed with status: %s",
+                                status_to_str (status)));
+      return;
+    }
+
+  fpi_ssm_jump_to_state (self->task_ssm, self->led_next_state);
 }
 
 static void
@@ -1631,11 +1820,11 @@ recv_add_image (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *er
 
       memcpy (data->template_id, template_id_offset, DB2_ID_SIZE);
 
-      fpi_ssm_next_state (self->task_ssm);
+      fpi_ssm_jump_to_state (self->task_ssm, ENROLL_SEND_LED_PROGRESS);
     }
   else
     {
-      fpi_ssm_jump_to_state (self->task_ssm, ENROLL_SET_EVENT_FINGER_PRESENCE);
+      fpi_ssm_jump_to_state (self->task_ssm, ENROLL_SEND_LED_RETRY);
     }
 }
 
@@ -1766,7 +1955,9 @@ recv_identify_match (FpDevice *device, guint8 *buffer_in, gsize length_in, GErro
           fpi_device_verify_report (device, FPI_MATCH_FAIL, NULL, NULL);
         }
 
-      fpi_ssm_next_state (self->task_ssm);
+      self->led_result_event = LED_EVENT_MATCH_FAILURE;
+      fpi_ssm_jump_to_state (self->task_ssm,
+                             IDENTIFY_VERIFY_SEND_LED_RESULT);
       return;
     }
 
@@ -1891,7 +2082,9 @@ recv_identify_match (FpDevice *device, guint8 *buffer_in, gsize length_in, GErro
         fpi_device_verify_report (device, FPI_MATCH_FAIL, print, NULL);
     }
 
-  fpi_ssm_next_state (self->task_ssm);
+  self->led_result_event = LED_EVENT_MATCH_SUCCESS;
+  fpi_ssm_jump_to_state (self->task_ssm,
+                         IDENTIFY_VERIFY_SEND_LED_RESULT);
 }
 
 static void
@@ -2059,7 +2252,9 @@ recv_get_image_metrics (FpDevice *device, guint8 *buffer_in, gsize length_in, GE
               else
                 fpi_device_verify_report (device, FPI_MATCH_ERROR, NULL, retry);
 
-              fpi_ssm_jump_to_state (self->task_ssm, IDENTIFY_VERIFY_COMPLETE);
+              self->led_result_event = LED_EVENT_MATCH_FAILURE;
+              fpi_ssm_jump_to_state (self->task_ssm,
+                                     IDENTIFY_VERIFY_SEND_LED_RESULT);
               return;
             }
 
@@ -3696,6 +3891,9 @@ synatlsmoc_open (FpDevice *device)
   FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
   GError *error = NULL;
 
+  self->has_leds = fpi_device_get_driver_data (device) ==
+                   SYNATLSMOC_DRIVER_DATA_HAS_LED;
+
   if (self->session == NULL && !g_usb_device_reset (
                                    fpi_device_get_usb_device (device), &error))
     {
@@ -3741,6 +3939,9 @@ synatlsmoc_close_ssm_run_state (FpiSsm *ssm, FpDevice *device)
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
+    case CLOSE_SEND_LED_IDLE:
+      send_led_event (self, LED_EVENT_IDLE, CLOSE_EVENT_MASK_NONE);
+      break;
     case CLOSE_EVENT_MASK_NONE:
       if (self->session_out_of_sync)
         {
@@ -4084,6 +4285,10 @@ synatlsmoc_enroll_run_state (FpiSsm *ssm, FpDevice *device)
     case ENROLL_SEND_FRAME_ACQUIRE:
       send_frame_acquire (self, FRAME_ACQ_FLAGS_ENROLL);
       break;
+    case ENROLL_SEND_LED_WAITING:
+      send_led_event (self, LED_EVENT_WAITING_FOR_FINGER,
+                      ENROLL_WAIT_FRAME_READY);
+      break;
     case ENROLL_WAIT_FRAME_READY:
       fpi_device_report_finger_status (device, FP_FINGER_STATUS_NEEDED);
       synatlsmoc_wait_for_events (self);
@@ -4098,12 +4303,23 @@ synatlsmoc_enroll_run_state (FpiSsm *ssm, FpDevice *device)
     case ENROLL_SEND_ADD_IMAGE:
       send_add_image (self);
       break;
+    case ENROLL_SEND_LED_RETRY:
+      send_led_event (self, LED_EVENT_ENROLL_RETRY,
+                      ENROLL_SET_EVENT_FINGER_PRESENCE);
+      break;
+    case ENROLL_SEND_LED_PROGRESS:
+      send_led_event (self, LED_EVENT_ENROLL_PROGRESS,
+                      ENROLL_ADD_ENROLLMENT);
+      break;
     case ENROLL_ADD_ENROLLMENT:
       sensor_add_enrollment (self, data->template_id, data->fp_user_id,
                              data->finger_id);
       break;
     case ENROLL_ENROLL_FINISH:
       send_enroll_finish (self);
+      break;
+    case ENROLL_SEND_LED_IDLE:
+      send_led_event (self, LED_EVENT_IDLE, ENROLL_REPORT);
       break;
     case ENROLL_REPORT:
       {
@@ -4174,6 +4390,10 @@ synatlsmoc_identify_verify_run_state (FpiSsm *ssm, FpDevice *device)
     case IDENTIFY_VERIFY_SEND_FRAME_ACQUIRE:;
       send_frame_acquire (self, FRAME_ACQ_FLAGS_MATCH);
       break;
+    case IDENTIFY_VERIFY_SEND_LED_WAITING:
+      send_led_event (self, LED_EVENT_WAITING_FOR_FINGER,
+                      IDENTIFY_VERIFY_WAIT_FRAME_READY);
+      break;
     case IDENTIFY_VERIFY_WAIT_FRAME_READY:
       fpi_device_report_finger_status (device, FP_FINGER_STATUS_NEEDED);
       synatlsmoc_wait_for_events (self);
@@ -4211,7 +4431,11 @@ synatlsmoc_identify_verify_run_state (FpiSsm *ssm, FpDevice *device)
               break;
             }
           send_identify_match (self, &verify_template_id, 1);
-        }
+      }
+      break;
+    case IDENTIFY_VERIFY_SEND_LED_RESULT:
+      send_led_event (self, self->led_result_event,
+                      IDENTIFY_VERIFY_COMPLETE);
       break;
     case IDENTIFY_VERIFY_COMPLETE:
       if (fpi_device_get_current_action (device) == FPI_DEVICE_ACTION_IDENTIFY)
