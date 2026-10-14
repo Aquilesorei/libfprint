@@ -515,8 +515,11 @@ synatlsmoc_cmd_receive_cb (FpiUsbTransfer *transfer,
 
       if (data->check_res && !status_is_success (status))
         {
+          FpDeviceError ferr = FP_DEVICE_ERROR_PROTO;
+          if (status == VCS_RESULT_DB_FULL)
+            ferr = FP_DEVICE_ERROR_DATA_FULL;
           fpi_ssm_mark_failed (transfer->ssm,
-                               set_and_report_error (FP_DEVICE_ERROR_PROTO,
+                               set_and_report_error (ferr,
                                                      "Command failed with status: %s",
                                                      status_to_str (status)));
           return;

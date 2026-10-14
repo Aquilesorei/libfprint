@@ -82,7 +82,7 @@ status_to_str (guint16 status)
       ret = "VCS_RESULT_DB_FULL";
       break;
     case 0x683:
-      ret = "VCS_RESULT_GEN_OBJECT_DOESNT_EXIST_2";
+      ret = "VCS_RESULT_GEN_OBJECT_DOESNT_EXIST_2 (none of the listed templates match)";
       break;
     case 0x689:
       ret = "VCS_RESULT_GEN_OPERATION_DENIED_2";
