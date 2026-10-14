@@ -70,6 +70,9 @@ typedef struct CmdData
   gboolean check_res;
   gsize length_in;
   CmdCallback callback;
+
+  gboolean wrapped;
+  gboolean reply_unwrapped;
 } CmdData;
 
 struct _FpiDeviceSynaTlsMoc
@@ -90,6 +93,7 @@ struct _FpiDeviceSynaTlsMoc
   SensorPairingData pairing_data;
   /* NOTE: host/this driver is the client, sensor is server */
   TlsSession *session;
+  gboolean session_out_of_sync;
   gboolean server_established;
 
   guint16 event_seq_num;
@@ -479,6 +483,7 @@ synatlsmoc_cmd_receive_cb (FpiUsbTransfer *transfer,
           fpi_ssm_mark_failed (transfer->ssm, local_error);
           return;
         }
+      data->reply_unwrapped = TRUE;
     }
   else
     {
@@ -573,6 +578,9 @@ synatlsmoc_cmd_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
   self->cmd_ssm = NULL;
   self->cmd_transfer = NULL;
 
+  if (error && data && data->wrapped && !data->reply_unwrapped)
+    self->session_out_of_sync = TRUE;
+
   if (error && data && data->callback)
     data->callback (device, NULL, 0, g_steal_pointer (&local_error));
 }
@@ -612,19 +620,20 @@ synatlsmoc_exec_cmd (FpiDeviceSynaTlsMoc *self, gboolean raw, gboolean check_res
 
   if (self->session && !raw)
     {
-      tls_session_wrap (self->session, cmd, cmd_size, &wrapped, &wrapped_len,
-                        &local_error);
+      if (self->session_out_of_sync)
+        local_error = set_and_report_error (FP_DEVICE_ERROR_PROTO,
+                                            "TLS session is out of sync");
+      else
+        tls_session_wrap (self->session, cmd, cmd_size, &wrapped, &wrapped_len,
+                          &local_error);
       if (local_error)
         {
           fpi_ssm_start (self->cmd_ssm, synatlsmoc_cmd_ssm_done);
-          fpi_ssm_mark_failed (self->cmd_ssm,
-                               set_and_report_error (FP_DEVICE_ERROR_PROTO,
-                                                     "Error while wrapping cmd: %s",
-                                                     local_error->message));
-          g_error_free (local_error);
+          fpi_ssm_mark_failed (self->cmd_ssm, local_error);
           return;
         }
 
+      data->wrapped = TRUE;
       data->length_in = resp_size + WRAP_RESPONSE_ADDITIONAL_SIZE;
 
 #ifdef DEBUG
@@ -915,31 +924,6 @@ recv_tls_data (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *err
     {
       fpi_ssm_next_state (self->task_ssm);
     }
-}
-
-static void
-recv_tls_close_data (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *error)
-{
-#ifdef DEBUG
-  fp_dbg ("Receive TLS handshake close callback");
-#endif
-  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
-
-  if (error)
-    {
-      fpi_ssm_mark_failed (self->task_ssm, error);
-      return;
-    }
-
-  GError *local_error = NULL;
-  if (!tls_session_receive_ciphertext (self->session, buffer_in, length_in,
-                                       &local_error))
-    {
-      fpi_ssm_mark_failed (self->task_ssm, local_error);
-      return;
-    }
-
-  fpi_ssm_mark_completed (self->task_ssm);
 }
 
 static void
@@ -3527,10 +3511,21 @@ fetch_pairing_data (FpiDeviceSynaTlsMoc *self)
 }
 
 static void
+synatlsmoc_drop_session (FpiDeviceSynaTlsMoc *self)
+{
+  g_clear_pointer (&self->session, tls_session_free);
+  self->session_out_of_sync = FALSE;
+}
+
+static void
 synatlsmoc_open_done (FpiSsm *ssm, FpDevice *device, GError *error)
 {
+  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
+
+  free_pairing_data (&self->pairing_data);
   if (error)
     {
+      synatlsmoc_drop_session (self);
       g_usb_device_release_interface (fpi_device_get_usb_device (device), 0, 0,
                                       NULL);
       synatlsmoc_task_ssm_done (ssm, device, error);
@@ -3542,9 +3537,9 @@ synatlsmoc_open_done (FpiSsm *ssm, FpDevice *device, GError *error)
 }
 
 static void
-synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *dev)
+synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *device)
 {
-  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (dev);
+  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
   OpenData *open_ssm_data = fpi_ssm_get_data (ssm);
   GError *error = NULL;
 
@@ -3557,8 +3552,7 @@ synatlsmoc_open_run_state (FpiSsm *ssm, FpDevice *dev)
       if ((self->session != NULL) && (!self->server_established))
         {
           fp_warn ("Host is in TLS session but sensor is not");
-          tls_session_free (self->session);
-          self->session = NULL;
+          synatlsmoc_drop_session (self);
           fpi_ssm_jump_to_state (ssm, OPEN_GET_VERSION);
         }
       else if (self->session == NULL && self->server_established)
@@ -3691,7 +3685,8 @@ synatlsmoc_open (FpDevice *device)
 
   self->interrupt_cancellable = g_cancellable_new ();
 
-  if (!g_usb_device_reset (fpi_device_get_usb_device (device), &error))
+  if (self->session == NULL && !g_usb_device_reset (
+                                   fpi_device_get_usb_device (device), &error))
     {
       fpi_device_open_complete (device, error);
       return;
@@ -3724,81 +3719,35 @@ synatlsmoc_cancel (FpDevice *device)
 }
 
 static void
-synatlsmoc_suspend (FpDevice *device)
+synatlsmoc_close_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
 {
-  FP_DBG_HIGHLIGHTED ("Suspend");
+  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
 
-  synatlsmoc_cancel (device);
-  g_cancellable_cancel (fpi_device_get_cancellable (device));
-  fpi_device_suspend_complete (device, NULL);
-}
+  if (self->session_out_of_sync)
+    synatlsmoc_drop_session (self);
 
-static void
-synatlsmoc_close_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
-{
-  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (dev);
+  g_usb_device_release_interface (fpi_device_get_usb_device (device), 0, 0, NULL);
 
-  tls_session_free (self->session);
-  self->session = NULL;
-
-  free_pairing_data (&self->pairing_data);
-
-  g_usb_device_release_interface (fpi_device_get_usb_device (dev), 0, 0, &error);
-
-  synatlsmoc_task_ssm_done (ssm, dev, error);
+  synatlsmoc_task_ssm_done (ssm, device, error);
 
   if (!error)
-    fpi_device_close_complete (dev, NULL);
+    fpi_device_close_complete (device, NULL);
 }
 
 static void
-close_tls_session (FpiDeviceSynaTlsMoc *self)
+synatlsmoc_close_ssm_run_state (FpiSsm *ssm, FpDevice *device)
 {
-  GError *error = NULL;
-  g_autofree guint8 *tls_data = NULL;
-
-  guint expected_recv_size = 256;
-
-#ifdef DEBUG
-  fp_dbg ("Closing TLS session...");
-#endif
-  if (!tls_session_close (self->session, &error))
-    {
-      fpi_ssm_mark_failed (self->task_ssm, error);
-      return;
-    }
-
-  gsize tls_size;
-
-  if (!tls_session_flush_send_buffer (self->session, &tls_data, &tls_size,
-                                      &error))
-    {
-      fpi_ssm_mark_failed (self->task_ssm, error);
-      return;
-    }
-
-  synatlsmoc_exec_cmd (self, TRUE, FALSE, tls_data, tls_size, expected_recv_size,
-                       recv_tls_close_data);
-}
-
-static void
-synatlsmoc_close_ssm_run_state (FpiSsm *ssm, FpDevice *dev)
-{
-  GError *error = NULL;
-  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (dev);
+  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case CLOSE_EVENT_MASK_NONE:
-      send_event_config (self, NO_EVENTS);
-      if (error)
-        fpi_ssm_mark_failed (ssm, error);
-      break;
-    case CLOSE_TLS_SESSION_CLOSE:
-      if (self->session)
+      if (self->session_out_of_sync)
         {
-          close_tls_session (self);
+          fpi_ssm_next_state (ssm);
+          return;
         }
+      send_event_config (self, NO_EVENTS);
       break;
     }
 }
@@ -3924,12 +3873,12 @@ synatlsmoc_list (FpDevice *device)
 }
 
 static void
-synatlsmoc_delete_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+synatlsmoc_delete_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
 {
-  synatlsmoc_task_ssm_done (ssm, dev, error);
+  synatlsmoc_task_ssm_done (ssm, device, error);
 
   if (!error)
-    fpi_device_delete_complete (dev, NULL);
+    fpi_device_delete_complete (device, NULL);
 }
 
 static gboolean
@@ -3975,9 +3924,9 @@ error:
 }
 
 static void
-synatlsmoc_delete_run_state (FpiSsm *ssm, FpDevice *dev)
+synatlsmoc_delete_run_state (FpiSsm *ssm, FpDevice *device)
 {
-  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (dev);
+  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
   DeleteData *delete_ssm_data = fpi_ssm_get_data (ssm);
 
   switch (fpi_ssm_get_cur_state (ssm))
@@ -4283,9 +4232,21 @@ fpi_device_synatlsmoc_init (FpiDeviceSynaTlsMoc *self)
 }
 
 static void
+fpi_device_synatlsmoc_finalize (GObject *object)
+{
+  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (object);
+
+  tls_session_free (self->session);
+
+  G_OBJECT_CLASS (fpi_device_synatlsmoc_parent_class)->finalize (object);
+}
+
+static void
 fpi_device_synatlsmoc_class_init (FpiDeviceSynaTlsMocClass *klass)
 {
   FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
+
+  G_OBJECT_CLASS (klass)->finalize = fpi_device_synatlsmoc_finalize;
 
   dev_class->id = FP_COMPONENT;
   dev_class->full_name = SYNATLSMOC_DRIVER_FULLNAME;
@@ -4305,7 +4266,6 @@ fpi_device_synatlsmoc_class_init (FpiDeviceSynaTlsMocClass *klass)
   dev_class->delete = synatlsmoc_delete;
   dev_class->clear_storage = synatlsmoc_clear_storage;
   dev_class->cancel = synatlsmoc_cancel;
-  dev_class->suspend = synatlsmoc_suspend;
 
   fpi_device_class_auto_initialize_features (dev_class);
 }

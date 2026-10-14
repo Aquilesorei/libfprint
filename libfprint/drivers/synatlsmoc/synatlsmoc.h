@@ -256,7 +256,6 @@ typedef enum
 typedef enum
 {
   CLOSE_EVENT_MASK_NONE,
-  CLOSE_TLS_SESSION_CLOSE,
   CLOSE_NUM_STATES,
 } CloseState;
 
