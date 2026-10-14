@@ -270,9 +270,12 @@ usb:v06CBp019D*
 
 # Supported by libfprint driver synatlsmoc
 usb:v06CBp00C9*
+usb:v06CBp00D1*
 usb:v06CBp00D8*
 usb:v06CBp00E7*
+usb:v06CBp00E9*
 usb:v06CBp00FF*
+usb:v06CBp0169*
  ID_AUTOSUSPEND=1
  ID_PERSIST=0
 
@@ -385,7 +388,6 @@ usb:v06CBp00CB*
 usb:v06CBp00DA*
 usb:v06CBp00DC*
 usb:v06CBp00E4*
-usb:v06CBp00E9*
 usb:v06CBp00FD*
 usb:v0A5Cp5801*
 usb:v0A5Cp5805*

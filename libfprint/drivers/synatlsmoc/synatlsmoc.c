@@ -115,13 +115,13 @@ G_DEFINE_TYPE (FpiDeviceSynaTlsMoc, fpi_device_synatlsmoc, FP_TYPE_DEVICE);
 static const FpIdEntry id_table[] = {
     /* the sensors commented out are untested, but should be suported */
     { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00C9, },
-    // { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00D1, },
+    { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00D1, },
     { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00D8, },
     { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00E7, },
-    { .vid = SYNAPTICS_VENDOR_ID, .pid = 0x00FF, },
+    { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00E9, },
+    { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x00FF, },
     // { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x0124, },
-    // { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x0169, },
-    { .vid = SYNAPTICS_VENDOR_ID, .pid = 0x016C, },
+    { .vid = SYNAPTICS_VENDOR_ID,  .pid = 0x0169, },
     { .vid = 0, .pid = 0, .driver_data = 0 }, /* terminating entry */
 };
 // clang-format on
