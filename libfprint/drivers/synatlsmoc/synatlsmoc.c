@@ -2201,7 +2201,7 @@ recv_db2_get_db2_info (FpDevice *device, guint8 *buffer_in, gsize length_in, GEr
   FpiByteReader reader;
   gboolean read_ok = TRUE;
 
-  Db2Info db2_info;
+  Db2Info db2_info = { 0 };
 
   fpi_byte_reader_init (&reader, buffer_in, length_in);
   read_ok &= fpi_byte_reader_skip (&reader, SENSOR_FW_REPLY_STATUS_HEADER_LEN);
@@ -3202,7 +3202,6 @@ synatlsmoc_event_interrupt_cb (FpiUsbTransfer *transfer,
   gboolean read_ok = TRUE;
 
   guint8 sensor_seq_num = 0;
-  ;
 
   // Get current sequence number
   fpi_byte_reader_init (&reader, transfer->buffer, transfer->actual_length);
