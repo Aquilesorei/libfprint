@@ -2048,12 +2048,16 @@ recv_get_image_metrics (FpDevice *device, guint8 *buffer_in, gsize length_in, GE
 
           if (matcher_img_quality < IMAGE_QUALITY_THRESHOLD)
             {
-              fpi_ssm_mark_failed (
-                  self->task_ssm,
-                  set_and_report_error (
-                      FP_DEVICE_ERROR_GENERAL,
-                      "Image quality %d%% is lower than threshold %d%%",
-                      matcher_img_quality, IMAGE_QUALITY_THRESHOLD));
+              GError *retry = fpi_device_retry_new_msg (
+                  FP_DEVICE_RETRY_GENERAL,
+                  "Image quality %d%% is lower than threshold %d%%",
+                  matcher_img_quality, IMAGE_QUALITY_THRESHOLD);
+              if (fpi_device_get_current_action (device) == FPI_DEVICE_ACTION_IDENTIFY)
+                fpi_device_identify_report (device, NULL, NULL, retry);
+              else
+                fpi_device_verify_report (device, FPI_MATCH_ERROR, NULL, retry);
+
+              fpi_ssm_jump_to_state (self->task_ssm, IDENTIFY_VERIFY_COMPLETE);
               return;
             }
 
