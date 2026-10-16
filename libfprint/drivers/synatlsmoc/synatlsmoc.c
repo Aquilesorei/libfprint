@@ -108,10 +108,14 @@ struct _FpiDeviceSynaTlsMoc
   /* quirks */
   gboolean disable_image_metrics;
   gboolean has_leds;
+
+  /* VCSFW_CMD_LED_EX2 */
   guint led_event;
   guint led_retries;
   guint led_next_state;
   guint led_result_event;
+  guint led_last_event;
+  gint64 led_last_time;
 };
 
 G_DEFINE_TYPE (FpiDeviceSynaTlsMoc, fpi_device_synatlsmoc, FP_TYPE_DEVICE);
@@ -465,8 +469,8 @@ enum
 {
   LED_EVENT_IDLE = 0,
   LED_EVENT_WAITING_FOR_FINGER,
-  LED_EVENT_ENROLL_RETRY,
-  LED_EVENT_ENROLL_PROGRESS,
+  LED_EVENT_ENROLL_ACCEPTED,
+  LED_EVENT_ENROLL_REJECTED,
   LED_EVENT_MATCH_SUCCESS,
   LED_EVENT_MATCH_FAILURE,
 };
@@ -484,62 +488,76 @@ typedef struct
 } LedProfile;
 
 #define LED_ACTION(field, p0, p1, p2) \
-  { (field), { (p0), (p1), (p2) } }
+  {                                   \
+    (field),                          \
+    {                                 \
+      (p0), (p1), (p2)                \
+    }                                 \
+  }
 
 #define LED_IDLE_ACTION LED_ACTION (0x0000, 0x20000000, 0x00000000, 0x00000000)
 #define LED_ZERO_ACTION LED_ACTION (0x0000, 0x00000000, 0x00000000, 0x00000000)
 
 static const LedProfile led_profiles[] = {
   [LED_EVENT_IDLE] = {
-    0,
-    { LED_IDLE_ACTION, LED_IDLE_ACTION, LED_IDLE_ACTION,
-      LED_IDLE_ACTION, LED_IDLE_ACTION, LED_IDLE_ACTION },
+      0,
+      { LED_IDLE_ACTION, LED_IDLE_ACTION, LED_IDLE_ACTION,
+        LED_IDLE_ACTION, LED_IDLE_ACTION, LED_IDLE_ACTION },
   },
   [LED_EVENT_WAITING_FOR_FINGER] = {
-    160000,
-    {
-      LED_ACTION (0xffff, 0x20000505, 0x00000000, 0x00000505),
-      LED_ACTION (0xffff, 0x20000505, 0x00000000, 0x00000505),
-      LED_ACTION (0xffff, 0x20000505, 0x00000000, 0x00000505),
-      LED_ZERO_ACTION, LED_ZERO_ACTION, LED_ZERO_ACTION,
-    },
+      160000,
+      {
+          LED_ACTION (0xffff, 0x20000505, 0x00000000, 0x00000505),
+          LED_ACTION (0xffff, 0x20000505, 0x00000000, 0x00000505),
+          LED_ACTION (0xffff, 0x20000505, 0x00000000, 0x00000505),
+          LED_ZERO_ACTION,
+          LED_ZERO_ACTION,
+          LED_ZERO_ACTION,
+      },
   },
-  [LED_EVENT_ENROLL_RETRY] = {
-    500,
-    {
-      LED_ACTION (0x01f4, 0x20000507, 0x00000000, 0x00000505),
-      LED_IDLE_ACTION,
-      LED_ACTION (0x01f4, 0x20000500, 0x00000000, 0x00000000),
-      LED_IDLE_ACTION, LED_ZERO_ACTION, LED_ZERO_ACTION,
-    },
+  [LED_EVENT_ENROLL_ACCEPTED] = {
+      500,
+      {
+          LED_ACTION (0x01f4, 0x20000507, 0x00000000, 0x00000505),
+          LED_IDLE_ACTION,
+          LED_ACTION (0x01f4, 0x20000500, 0x00000000, 0x00000000),
+          LED_IDLE_ACTION,
+          LED_ZERO_ACTION,
+          LED_ZERO_ACTION,
+      },
   },
-  [LED_EVENT_ENROLL_PROGRESS] = {
-    1000,
-    {
-      LED_ACTION (0x01f4, 0x20000107, 0x00000101, 0x00000000),
-      LED_IDLE_ACTION,
-      LED_ACTION (0x01f4, 0x20000100, 0x00000000, 0x00000000),
-      LED_IDLE_ACTION, LED_ZERO_ACTION, LED_ZERO_ACTION,
-    },
+  [LED_EVENT_ENROLL_REJECTED] = {
+      1000,
+      {
+          LED_ACTION (0x01f4, 0x20000107, 0x00000101, 0x00000000),
+          LED_IDLE_ACTION,
+          LED_ACTION (0x01f4, 0x20000100, 0x00000000, 0x00000000),
+          LED_IDLE_ACTION,
+          LED_ZERO_ACTION,
+          LED_ZERO_ACTION,
+      },
   },
   [LED_EVENT_MATCH_SUCCESS] = {
-    500,
-    {
-      LED_ACTION (0x01f4, 0x20000507, 0x00000000, 0x00000505),
-      LED_IDLE_ACTION,
-      LED_ACTION (0x01f4, 0x20000500, 0x00000000, 0x00000000),
-      LED_IDLE_ACTION, LED_ZERO_ACTION, LED_ZERO_ACTION,
-    },
+      500,
+      {
+          LED_ACTION (0x01f4, 0x20000507, 0x00000000, 0x00000505),
+          LED_IDLE_ACTION,
+          LED_ACTION (0x01f4, 0x20000500, 0x00000000, 0x00000000),
+          LED_IDLE_ACTION,
+          LED_ZERO_ACTION,
+          LED_ZERO_ACTION,
+      },
   },
   [LED_EVENT_MATCH_FAILURE] = {
-    1000,
-    {
-      LED_ACTION (0x004b, 0x20000107, 0x00000101, 0x00000000),
-      LED_ACTION (0x004b, 0x20000001, 0x00000000, 0x00000000),
-      LED_ACTION (0x004b, 0x20000101, 0x00000000, 0x00000000),
-      LED_ACTION (0x004b, 0x20000001, 0x00000000, 0x00000000),
-      LED_ZERO_ACTION, LED_ZERO_ACTION,
-    },
+      1000,
+      {
+          LED_ACTION (0x004b, 0x20000107, 0x00000101, 0x00000000),
+          LED_ACTION (0x004b, 0x20000001, 0x00000000, 0x00000000),
+          LED_ACTION (0x004b, 0x20000101, 0x00000000, 0x00000000),
+          LED_ACTION (0x004b, 0x20000001, 0x00000000, 0x00000000),
+          LED_ZERO_ACTION,
+          LED_ZERO_ACTION,
+      },
   },
 };
 
@@ -575,7 +593,6 @@ send_led_event_command (FpiDeviceSynaTlsMoc *self)
   FAIL_TASK_SSM_AND_RETURN_ON_WRONG_SEND_SIZE (writer, send_size);
 
   g_autofree guint8 *cmd = fpi_byte_writer_reset_and_get_data (&writer);
-  /* 0xd1 is VCS_RESULT_SENSOR_BAD_CMD in the Windows implementation. */
   synatlsmoc_exec_cmd (self, FALSE, FALSE, cmd, send_size,
                        expected_recv_size, recv_led_event);
 }
@@ -592,6 +609,26 @@ send_led_event (FpiDeviceSynaTlsMoc *self, guint event, guint next_state)
       fpi_ssm_jump_to_state (self->task_ssm, next_state);
       return;
     }
+
+  if (self->led_last_event != LED_EVENT_WAITING_FOR_FINGER)
+    {
+      gint64 elapsed_ms = (g_get_monotonic_time () - self->led_last_time) / 1000;
+      gint64 duration_ms = led_profiles[self->led_last_event].duration_ms;
+
+      if (elapsed_ms < duration_ms)
+        {
+          if (event == LED_EVENT_WAITING_FOR_FINGER)
+            fpi_ssm_jump_to_state_delayed (self->task_ssm,
+                                           fpi_ssm_get_cur_state (self->task_ssm),
+                                           duration_ms - elapsed_ms);
+          else
+            fpi_ssm_jump_to_state (self->task_ssm, next_state);
+          return;
+        }
+    }
+
+  self->led_last_event = event;
+  self->led_last_time = g_get_monotonic_time ();
 
   send_led_event_command (self);
 }
@@ -624,14 +661,7 @@ recv_led_event (FpDevice *device, guint8 *buffer_in, gsize length_in,
     }
 
   if (!status_is_success (status))
-    {
-      fpi_ssm_mark_failed (
-          self->task_ssm,
-          set_and_report_error (FP_DEVICE_ERROR_PROTO,
-                                "LED_EX2 failed with status: %s",
-                                status_to_str (status)));
-      return;
-    }
+    fp_warn ("LED_EX2 failed with status: %s", status_to_str (status));
 
   fpi_ssm_jump_to_state (self->task_ssm, self->led_next_state);
 }
@@ -1811,7 +1841,8 @@ recv_add_image (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *er
 
   fpi_device_enroll_progress (device, enroll_stats.template_cnt, NULL, retry);
 
-  if (enroll_stats.progress == 100)
+  data->complete = enroll_stats.progress == 100;
+  if (data->complete)
     {
 #ifdef DEBUG
       fp_dbg ("Enrollment completed successfully with quality %d",
@@ -1819,13 +1850,10 @@ recv_add_image (FpDevice *device, guint8 *buffer_in, gsize length_in, GError *er
 #endif
 
       memcpy (data->template_id, template_id_offset, DB2_ID_SIZE);
+    }
 
-      fpi_ssm_jump_to_state (self->task_ssm, ENROLL_SEND_LED_PROGRESS);
-    }
-  else
-    {
-      fpi_ssm_jump_to_state (self->task_ssm, ENROLL_SEND_LED_RETRY);
-    }
+  self->led_result_event = data->complete || enroll_stats.rejected == 0 ? LED_EVENT_ENROLL_ACCEPTED : LED_EVENT_ENROLL_REJECTED;
+  fpi_ssm_jump_to_state (self->task_ssm, ENROLL_SEND_LED_RESULT);
 }
 
 static void
@@ -2045,6 +2073,7 @@ recv_identify_match (FpDevice *device, guint8 *buffer_in, gsize length_in, GErro
               template_id_len, sizeof (Db2Id),
               user_id_len, sizeof (FpUserId),
               finger_id_len, sizeof (FingerId)));
+      return;
     }
 
   /* Create a new print from template_id, user_id and finger_id and then see
@@ -2889,6 +2918,7 @@ recv_db2_get_payload_data (FpDevice *device, guint8 *buffer_in, gsize length_in,
               template_id_len, sizeof (Db2Id),
               user_id_len, sizeof (FpUserId),
               finger_id_len, sizeof (FingerId)));
+      return;
     }
 
 #ifdef DEBUG
@@ -3891,8 +3921,8 @@ synatlsmoc_open (FpDevice *device)
   FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
   GError *error = NULL;
 
-  self->has_leds = fpi_device_get_driver_data (device) ==
-                   SYNATLSMOC_DRIVER_DATA_HAS_LED;
+  self->has_leds = (fpi_device_get_driver_data (device) &
+                    SYNATLSMOC_DRIVER_DATA_HAS_LED) != 0;
 
   if (self->session == NULL && !g_usb_device_reset (
                                    fpi_device_get_usb_device (device), &error))
@@ -4200,6 +4230,9 @@ synatlsmoc_capture_finish_run_state (FpiSsm *ssm, FpDevice *device)
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
+    case CAPTURE_FINISH_LED_IDLE:
+      send_led_event (self, LED_EVENT_IDLE, CAPTURE_FINISH_EVENT_MASK_NONE);
+      break;
     case CAPTURE_FINISH_EVENT_MASK_NONE:
       send_event_config (self, NO_EVENTS);
       break;
@@ -4293,6 +4326,9 @@ synatlsmoc_enroll_run_state (FpiSsm *ssm, FpDevice *device)
       fpi_device_report_finger_status (device, FP_FINGER_STATUS_NEEDED);
       synatlsmoc_wait_for_events (self);
       break;
+    case ENROLL_SEND_LED_FINGER_DETECTED:
+      send_led_event (self, LED_EVENT_IDLE, ENROLL_SET_EVENT_NONE);
+      break;
     case ENROLL_SET_EVENT_NONE:
       fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
       send_event_config (self, NO_EVENTS);
@@ -4303,13 +4339,9 @@ synatlsmoc_enroll_run_state (FpiSsm *ssm, FpDevice *device)
     case ENROLL_SEND_ADD_IMAGE:
       send_add_image (self);
       break;
-    case ENROLL_SEND_LED_RETRY:
-      send_led_event (self, LED_EVENT_ENROLL_RETRY,
-                      ENROLL_SET_EVENT_FINGER_PRESENCE);
-      break;
-    case ENROLL_SEND_LED_PROGRESS:
-      send_led_event (self, LED_EVENT_ENROLL_PROGRESS,
-                      ENROLL_ADD_ENROLLMENT);
+    case ENROLL_SEND_LED_RESULT:
+      send_led_event (self, self->led_result_event,
+                      data->complete ? ENROLL_ADD_ENROLLMENT : ENROLL_SET_EVENT_FINGER_PRESENCE);
       break;
     case ENROLL_ADD_ENROLLMENT:
       sensor_add_enrollment (self, data->template_id, data->fp_user_id,
@@ -4317,9 +4349,6 @@ synatlsmoc_enroll_run_state (FpiSsm *ssm, FpDevice *device)
       break;
     case ENROLL_ENROLL_FINISH:
       send_enroll_finish (self);
-      break;
-    case ENROLL_SEND_LED_IDLE:
-      send_led_event (self, LED_EVENT_IDLE, ENROLL_REPORT);
       break;
     case ENROLL_REPORT:
       {
@@ -4398,6 +4427,9 @@ synatlsmoc_identify_verify_run_state (FpiSsm *ssm, FpDevice *device)
       fpi_device_report_finger_status (device, FP_FINGER_STATUS_NEEDED);
       synatlsmoc_wait_for_events (self);
       break;
+    case IDENTIFY_VERIFY_SEND_LED_FINGER_DETECTED:
+      send_led_event (self, LED_EVENT_IDLE, IDENTIFY_VERIFY_SET_EVENT_NONE);
+      break;
     case IDENTIFY_VERIFY_SET_EVENT_NONE:
       fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
       send_event_config (self, NO_EVENTS);
@@ -4431,7 +4463,7 @@ synatlsmoc_identify_verify_run_state (FpiSsm *ssm, FpDevice *device)
               break;
             }
           send_identify_match (self, &verify_template_id, 1);
-      }
+        }
       break;
     case IDENTIFY_VERIFY_SEND_LED_RESULT:
       send_led_event (self, self->led_result_event,

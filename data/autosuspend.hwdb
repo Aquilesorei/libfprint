@@ -269,8 +269,10 @@ usb:v06CBp019D*
  ID_PERSIST=0
 
 # Supported by libfprint driver synatlsmoc
+usb:v047Dp8054*
 usb:v06CBp00C9*
 usb:v06CBp00D1*
+usb:v06CBp00D6*
 usb:v06CBp00D8*
 usb:v06CBp00E7*
 usb:v06CBp00E9*
@@ -346,7 +348,6 @@ usb:v138Ap0091*
 # Known unsupported devices
 usb:v0A5Cp5802*
 usb:v047Dp00F2*
-usb:v047Dp8054*
 usb:v047Dp8055*
 usb:v04E8p730B*
 usb:v04F3p036B*
