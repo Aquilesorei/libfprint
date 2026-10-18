@@ -990,6 +990,19 @@ recv_get_version (FpDevice *device, guchar *buffer_in, gsize length_in, GError *
 
   if (error)
     {
+      OpenData *open_ssm_data = fpi_ssm_get_data (self->task_ssm);
+
+      if (!open_ssm_data->tried_get_version_reset)
+        {
+          fp_warn ("get_version failed (%s), resetting and retrying", error->message);
+          open_ssm_data->tried_get_version_reset = TRUE;
+          g_clear_error (&error);
+          if (g_usb_device_reset (fpi_device_get_usb_device (device), &error))
+            {
+              fpi_ssm_jump_to_state (self->task_ssm, OPEN_TLS_STATUS);
+              return;
+            }
+        }
       fpi_ssm_mark_failed (self->task_ssm, error);
       return;
     }

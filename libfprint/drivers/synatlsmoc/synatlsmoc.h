@@ -454,6 +454,7 @@ typedef struct
 typedef struct
 {
   gboolean tried_to_exit_bootloader_mode;
+  gboolean tried_get_version_reset;
   EVP_PKEY *pub_key;
 } OpenData;
 
