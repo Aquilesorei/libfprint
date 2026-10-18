@@ -1002,6 +1002,7 @@ recv_get_version (FpDevice *device, guchar *buffer_in, gsize length_in, GError *
               fpi_ssm_jump_to_state (self->task_ssm, OPEN_TLS_STATUS);
               return;
             }
+          fp_warn ("USB reset failed: %s", error->message);
         }
       fpi_ssm_mark_failed (self->task_ssm, error);
       return;
