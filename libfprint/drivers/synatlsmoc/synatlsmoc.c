@@ -103,6 +103,14 @@ struct _FpiDeviceSynaTlsMoc
   guint num_pending_events;
   gboolean event_read_in_legacy_mode;
 
+  /* suspend/resume of an identify/verify waiting for the finger */
+  GCancellable *interrupt_cancellable;
+  gulong interrupt_cancel_id;
+  FpiSsm *paused_ssm;
+  gboolean suspending;
+  gboolean suspended;
+  gboolean restart_tried;
+
   gboolean capture_started;
 
   /* quirks */
@@ -3425,6 +3433,8 @@ synatlsmoc_load_sample_pairing_data (FpiDeviceSynaTlsMoc *self)
 }
 #endif
 
+static void synatlsmoc_pause_capture (FpiDeviceSynaTlsMoc *self);
+
 static void
 synatlsmoc_event_interrupt_cb (FpiUsbTransfer *transfer,
                                FpDevice *device,
@@ -3435,9 +3445,36 @@ synatlsmoc_event_interrupt_cb (FpiUsbTransfer *transfer,
   fp_dbg ("Wait for events callback");
 #endif
   FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
+  FpiDeviceAction action = fpi_device_get_current_action (device);
+
+  g_cancellable_disconnect (fpi_device_get_cancellable (device),
+                            self->interrupt_cancel_id);
+  self->interrupt_cancel_id = 0;
+  g_clear_object (&self->interrupt_cancellable);
+
+  if (self->suspending)
+    {
+      g_clear_error (&error);
+      synatlsmoc_pause_capture (self);
+      return;
+    }
 
   if (error)
     {
+      /* The event wait does not survive a suspend that raced with the start
+       * of the identify/verify: stop the capture and start over once. */
+      if (!self->restart_tried &&
+          (action == FPI_DEVICE_ACTION_VERIFY ||
+           action == FPI_DEVICE_ACTION_IDENTIFY) &&
+          g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_NO_DEVICE))
+        {
+          fp_warn ("Event wait failed (%s), restarting capture", error->message);
+          self->restart_tried = TRUE;
+          g_clear_error (&error);
+          synatlsmoc_pause_capture (self);
+          return;
+        }
+
       fpi_ssm_mark_failed (self->task_ssm, error);
       return;
     }
@@ -3469,6 +3506,13 @@ synatlsmoc_event_interrupt_cb (FpiUsbTransfer *transfer,
 }
 
 static void
+cancel_interrupt (GCancellable *device_cancellable,
+                  GCancellable *interrupt_cancellable)
+{
+  g_cancellable_cancel (interrupt_cancellable);
+}
+
+static void
 synatlsmoc_wait_for_events (FpiDeviceSynaTlsMoc *self)
 {
 #ifdef DEBUG
@@ -3479,9 +3523,17 @@ synatlsmoc_wait_for_events (FpiDeviceSynaTlsMoc *self)
   transfer->ssm = self->task_ssm;
   transfer->short_is_error = TRUE;
 
+  /* Own cancellable, so that a suspend can stop the wait without
+   * cancelling the action */
+  self->interrupt_cancellable = g_cancellable_new ();
+  self->interrupt_cancel_id =
+      g_cancellable_connect (fpi_device_get_cancellable (FP_DEVICE (self)),
+                             G_CALLBACK (cancel_interrupt),
+                             self->interrupt_cancellable, NULL);
+
   fpi_usb_transfer_fill_interrupt (transfer, SYNATLSMOC_EP_INTERRUPT, 7);
   fpi_usb_transfer_submit (transfer, SYNATLSMOC_USB_INTERRUPT_TIMEOUT,
-                           fpi_device_get_cancellable (FP_DEVICE (self)),
+                           self->interrupt_cancellable,
                            synatlsmoc_event_interrupt_cb, NULL);
 }
 
@@ -4270,6 +4322,91 @@ synatlsmoc_capture_finish_done (FpiSsm *ssm, FpDevice *device, GError *error)
 }
 
 static void
+synatlsmoc_pause_capture_done (FpiSsm *ssm, FpDevice *device, GError *error)
+{
+  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
+  gboolean suspending = self->suspending;
+
+  self->task_ssm = g_steal_pointer (&self->paused_ssm);
+  self->suspending = FALSE;
+
+  if (suspending)
+    {
+      self->suspended = error == NULL;
+      fpi_device_suspend_complete (device, NULL);
+    }
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (self->task_ssm, error);
+      return;
+    }
+
+  if (!suspending)
+    fpi_ssm_jump_to_state (self->task_ssm,
+                           IDENTIFY_VERIFY_SET_EVENT_FINGER_PRESENCE);
+}
+
+/* Stop the capture of an identify/verify waiting for an event, the same way
+ * a failed capture is finished, then suspend or restart it. */
+static void
+synatlsmoc_pause_capture (FpiDeviceSynaTlsMoc *self)
+{
+  FpDevice *device = FP_DEVICE (self);
+  gint nr_states = self->capture_started ? CAPTURE_FINISH_NUM_STATES
+                                         : CAPTURE_FINISH_FRAME_FINISH;
+
+  self->paused_ssm = g_steal_pointer (&self->task_ssm);
+
+  if (self->session_out_of_sync)
+    {
+      synatlsmoc_pause_capture_done (
+          NULL, device,
+          set_and_report_error (FP_DEVICE_ERROR_PROTO, "TLS session out of sync"));
+      return;
+    }
+
+  self->task_ssm = fpi_ssm_new_full (device, synatlsmoc_capture_finish_run_state,
+                                     nr_states, nr_states, "Pause capture");
+  fpi_ssm_start (self->task_ssm, synatlsmoc_pause_capture_done);
+}
+
+static void
+synatlsmoc_suspend (FpDevice *device)
+{
+  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
+  FpiDeviceAction action = fpi_device_get_current_action (device);
+
+  /* Only the wait for the finger can be interrupted */
+  if ((action != FPI_DEVICE_ACTION_VERIFY &&
+       action != FPI_DEVICE_ACTION_IDENTIFY) ||
+      self->interrupt_cancellable == NULL)
+    {
+      fpi_device_suspend_complete (device,
+                                   fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
+      return;
+    }
+
+  self->suspending = TRUE;
+  g_cancellable_cancel (self->interrupt_cancellable);
+}
+
+static void
+synatlsmoc_resume (FpDevice *device)
+{
+  FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
+
+  fpi_device_resume_complete (device, NULL);
+
+  if (!self->suspended)
+    return;
+
+  self->suspended = FALSE;
+  fpi_ssm_jump_to_state (self->task_ssm,
+                         IDENTIFY_VERIFY_SET_EVENT_FINGER_PRESENCE);
+}
+
+static void
 synatlsmoc_capture_task_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
 {
   FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
@@ -4499,6 +4636,7 @@ synatlsmoc_identify_verify (FpDevice *device)
   FpiDeviceSynaTlsMoc *self = FPI_DEVICE_SYNATLSMOC (device);
 
   g_assert (self->task_ssm == NULL);
+  self->restart_tried = FALSE;
 
   IdentifyVerifyData *ssm_data = g_new0 (IdentifyVerifyData, 1);
   ssm_data->frame_acquire_retry_idx = FRAME_ACQUIRE_NUM_RETRIES;
@@ -4580,6 +4718,8 @@ fpi_device_synatlsmoc_class_init (FpiDeviceSynaTlsMocClass *klass)
   dev_class->list = synatlsmoc_list;
   dev_class->delete = synatlsmoc_delete;
   dev_class->clear_storage = synatlsmoc_clear_storage;
+  dev_class->suspend = synatlsmoc_suspend;
+  dev_class->resume = synatlsmoc_resume;
 
   fpi_device_class_auto_initialize_features (dev_class);
 }
